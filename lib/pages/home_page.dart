@@ -1,0 +1,1584 @@
+import 'package:flutter/material.dart';
+import '../theme/app_theme.dart';
+import '../widgets/work_timer.dart';
+import '../widgets/rest_timer.dart';
+import '../utils/time_service.dart';
+import '../utils/salary_calculator.dart';
+import '../utils/settings_service.dart';
+import '../utils/holiday_service.dart';
+import '../utils/notification_service.dart';
+import '../config/env_config.dart';
+import '../data/rest_earnings_messages.dart'; // 引入文案文件
+import '../data/overtime_messages.dart'; // 引入加班文案文件
+import 'dart:async';
+import 'package:excel/excel.dart' hide Border;
+import 'package:path_provider/path_provider.dart';
+import 'package:intl/intl.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/rendering.dart';
+import 'dart:io';
+
+enum WorkStatus {
+  working,
+  resting,
+  offWork,
+  overtime,
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> with TickerProviderStateMixin, WidgetsBindingObserver {
+  final TimeService _timeService = TimeService();
+  final SettingsService _settingsService = SettingsService();
+  final HolidayService _holidayService = HolidayService();
+  final NotificationService _notificationService = NotificationService();
+  WorkStatus _currentStatus = WorkStatus.working;
+  Timer? _timer; // 主定时器
+  Timer? _statusCheckTimer;
+  Timer? _restStateSaveTimer;
+  Timer? _hourlyRateUpdateTimer;
+  final ValueNotifier<double> _currentRate = ValueNotifier(0);
+  final ValueNotifier<double> _todayEarnings = ValueNotifier(0);
+  final ValueNotifier<double> _restEarnings = ValueNotifier(0);
+  final ValueNotifier<double> _yearToDateEarnings = ValueNotifier(0);
+  final ValueNotifier<double> _weekRestEarnings = ValueNotifier(0);
+  bool _isManualResting = false;
+  bool _isManualOvertime = false;
+  DateTime? _restStartTime;
+  DateTime? _overtimeStartTime;
+  Duration _restDuration = Duration.zero;
+  Duration _overtimeDuration = Duration.zero;
+  Duration _lastRestDuration = Duration.zero;
+  Duration _lastOvertimeDuration = Duration.zero;
+  final String _statusText = "一杯奶茶到手";
+  
+  // 添加数据隐藏状态变量
+  bool _isDataHidden = false;
+  
+  late TimeOfDay _startTime;
+  late TimeOfDay _endTime;
+  late String _salaryType;
+  late double _salary;
+
+  // 添加保存应用状态的键
+  static const String _isRestingKey = 'is_resting_state';
+  static const String _restStartTimeKey = 'rest_start_time';
+  static const String _lastRestDurationKey = 'last_rest_duration';
+  // 加班状态键
+  static const String _isOvertimeKey = 'is_overtime_state';
+  static const String _overtimeStartTimeKey = 'overtime_start_time';
+  static const String _lastOvertimeDurationKey = 'last_overtime_duration';
+
+  String? _lastSavedDailyDataDate; // 记录最后一次保存每日数据的日期
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+    _settingsService.settingsChangedNotifier.addListener(_handleSettingsChanged);
+    
+    // 初始化当前时薪通知器的值为标准时薪
+    _currentRate.value = _settingsService.getHourlySalary();
+    
+    // 恢复上次的摸鱼状态
+    _restoreRestState();
+    
+    // 每秒更新状态和加班时长
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      _updateStatus();
+      _updateTodayEarnings();
+      _updateOvertimeDuration();
+      _updateRestDuration(); // 添加摸鱼时长更新
+      _updateCurrentHourlyRate(); // 添加当前时薪更新
+      _saveRestStateIfNeeded(); // 定期保存摸鱼时长
+    });
+    
+    // 移除不必要的收入卡片定时器
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _hourlyRateUpdateTimer?.cancel(); // 确保释放高频率定时器
+    // 移除不必要的收入卡片定时器清理
+    _settingsService.settingsChangedNotifier.removeListener(_handleSettingsChanged);
+    _currentRate.dispose(); // 释放通知器资源
+    super.dispose();
+  }
+
+  void _handleSettingsChanged() {
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    setState(() {
+      _startTime = _settingsService.getStartTime();
+      _endTime = _settingsService.getEndTime();
+      _salaryType = _settingsService.getSalaryType();
+      _salary = _settingsService.getSalary();
+      
+      // 更新当前时薪通知器的值为最新的标准时薪
+      _currentRate.value = _settingsService.getHourlySalary();
+    });
+    
+    if (_timer == null) {
+      _startTimer();
+    } else {
+      _updateStatus();
+      _updateTodayEarnings();
+    }
+    
+    // 如果当前是加班状态，确保高频率定时器运行
+    if (_currentStatus == WorkStatus.overtime && _hourlyRateUpdateTimer == null) {
+      _startHighFrequencyHourlyRateUpdate();
+    }
+  }
+
+  void _startTimer() {
+    // 立即更新一次状态和收入
+    _updateStatus();
+    _updateTodayEarnings();
+    
+    // 每秒更新一次状态和收入
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      _updateStatus();
+      _updateTodayEarnings();
+    });
+  }
+
+  void _updateStatus() {
+    final now = _timeService.now();
+    final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
+    
+    // 1. 检查是否是国家法定节假日
+    final isHoliday = _holidayService.isHoliday(now);
+    final isSpecialWorkDay = _holidayService.isWorkday(now); // 调休上班日
+    
+    // 2. 移除检查用户设置的工作日逻辑
+    
+    // 3. 检查是否在工作时间内
+    final bool isWorkTime = _isWithinWorkTime(currentTimeOfDay);
+    
+    // 4. 检查是否到达或超过下班时间
+    final bool isEndOfWorkday = _isAtOrPastEndTime(currentTimeOfDay);
+    
+    // 综合判断是否是工作日
+    // 如果是法定节假日，则不是工作日
+    // 如果是特殊调休上班日，则是工作日
+    // 否则，周一至周五是工作日，周六日不是工作日
+    final bool isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
+    final bool isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
+    
+    // 记录当前状态用于后续判断是否发生了状态变化
+    final previousStatus = _currentStatus;
+    
+    // 更新工作状态
+    setState(() {
+      if (isWorkDay && isWorkTime) {
+        // 在工作日的工作时间内
+        if (_isManualResting) {
+          _currentStatus = WorkStatus.resting;
+        } else {
+          _currentStatus = WorkStatus.working;
+        }
+      } else {
+        // 非工作时间或非工作日
+        if (_isManualOvertime) {
+          _currentStatus = WorkStatus.overtime;
+        } else {
+          // 如果是下班时间且用户处于摸鱼状态，强制切换为下班状态
+          if (_currentStatus == WorkStatus.resting && isEndOfWorkday) {
+            _isManualResting = false; // 重置手动摸鱼状态
+          }
+          _currentStatus = WorkStatus.offWork;
+        }
+      }
+    });
+    
+    // 如果状态从摸鱼中变为下班中，则保存摸鱼数据并清理状态
+    if (previousStatus == WorkStatus.resting && _currentStatus == WorkStatus.offWork) {
+      // 保存当前摸鱼时长
+      final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+      if (_restStartTime != null) {
+        // 计算最终摸鱼时长
+        final currentSessionDuration = now.difference(_restStartTime!);
+        _lastRestDuration = _lastRestDuration + currentSessionDuration;
+        _restDuration = _lastRestDuration;
+        
+        // 保存摸鱼时长到每日统计
+        _settingsService.setDailyRestMinutes(dateStr, _restDuration.inMinutes);
+        
+        // 清除摸鱼状态
+        _restStartTime = null;
+        _isManualResting = false;
+        _saveRestDuration();
+      }
+    }
+    
+    // 如果状态从加班中变为下班中，则保存加班数据并清理状态
+    if (previousStatus == WorkStatus.overtime && _currentStatus == WorkStatus.offWork) {
+      // 保存当前加班时长
+      final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+      if (_overtimeStartTime != null) {
+        // 计算最终加班时长
+        final currentSessionDuration = now.difference(_overtimeStartTime!);
+        _lastOvertimeDuration = _lastOvertimeDuration + currentSessionDuration;
+        _overtimeDuration = _lastOvertimeDuration;
+        
+        // 保存加班时长到每日统计
+        final previousOvertimeMinutes = _settingsService.getOvertimeMinutes(dateStr);
+        final newOvertimeMinutes = previousOvertimeMinutes + currentSessionDuration.inMinutes;
+        _settingsService.setOvertimeMinutes(dateStr, newOvertimeMinutes);
+        
+        // 清除加班状态
+        _overtimeStartTime = null;
+        _isManualOvertime = false;
+        _saveOvertimeDuration();
+        
+        // 停止高频率更新当前时薪
+        _stopHighFrequencyHourlyRateUpdate();
+      }
+    }
+    
+    // 获取当前日期字符串
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    
+    // 获取昨天的日期字符串
+    final yesterday = now.subtract(const Duration(days: 1));
+    final yesterdayStr = '${yesterday.year}-${yesterday.month.toString().padLeft(2, '0')}-${yesterday.day.toString().padLeft(2, '0')}';
+    
+    // 新的保存数据触发条件：
+    // 1. 上班时间刚到（早上），用于保存前一天的数据
+    // 2. 当前是工作日
+    // 3. 前一天的数据尚未保存
+    if (isWorkDay && _isAtStartTime(currentTimeOfDay) && yesterdayStr != _lastSavedDailyDataDate) {
+      // 保存昨天的数据
+      _saveDailyData(yesterdayStr);
+    }
+  }
+
+  void _updateTodayEarnings() {
+    // 只更新_todayEarnings变量，不触发UI重建
+    _todayEarnings.value = SalaryCalculator.calculateTodayEarnings(
+      currentTime: _timeService.now(),
+      startTime: _startTime,
+      endTime: _endTime,
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+  }
+
+  bool _isWithinWorkTime(TimeOfDay current) {
+    final currentMinutes = current.hour * 60 + current.minute;
+    final startMinutes = _startTime.hour * 60 + _startTime.minute;
+    final endMinutes = _endTime.hour * 60 + _endTime.minute;
+    
+    return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+  }
+
+  bool _isAtOrPastEndTime(TimeOfDay current) {
+    final currentMinutes = current.hour * 60 + current.minute;
+    final endMinutes = _endTime.hour * 60 + _endTime.minute;
+    
+    return currentMinutes >= endMinutes;
+  }
+
+  // 检查是否刚好到达上班时间
+  bool _isAtStartTime(TimeOfDay current) {
+    final currentMinutes = current.hour * 60 + current.minute;
+    final startMinutes = _startTime.hour * 60 + _startTime.minute;
+    
+    // 允许有5分钟的误差范围，确保不会错过触发
+    return currentMinutes >= startMinutes && currentMinutes <= startMinutes + 5;
+  }
+  
+  // 获取实际下班时间，考虑加班情况
+  DateTime _getActualEndTime(String dateStr) {
+    final now = _timeService.now();
+    final date = DateTime(now.year, now.month, now.day);
+    
+    // 解析日期字符串
+    final parts = dateStr.split('-');
+    final targetDate = DateTime(
+      int.parse(parts[0]),
+      int.parse(parts[1]),
+      int.parse(parts[2]),
+    );
+    
+    // 标准下班时间
+    final standardEndTime = DateTime(
+      targetDate.year,
+      targetDate.month,
+      targetDate.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
+    
+    // 获取该日期的加班时长（分钟）
+    final overtimeMinutes = _settingsService.getOvertimeMinutes(dateStr);
+    
+    // 如果有加班，则将加班时长添加到标准下班时间
+    if (overtimeMinutes > 0) {
+      return standardEndTime.add(Duration(minutes: overtimeMinutes));
+    } else {
+      return standardEndTime;
+    }
+  }
+
+  void _handleStatusButtonPressed() {
+    final now = _timeService.now();
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    
+    setState(() {
+      switch (_currentStatus) {
+        case WorkStatus.working:
+          // 搬砖中 -> 摸鱼中
+          _isManualResting = true;
+          _currentStatus = WorkStatus.resting;
+          // 使用上次保存的完整摸鱼时长（包含秒）
+          _restDuration = _lastRestDuration;
+          // 记录摸鱼开始时间为当前时间
+          _restStartTime = now;
+          // 立即保存状态，避免意外退出导致状态丢失
+          _saveRestDuration();
+          break;
+        case WorkStatus.resting:
+          // 摸鱼中 -> 搬砖中
+          _isManualResting = false;
+          _currentStatus = WorkStatus.working;
+          // 保存当前完整的摸鱼时长（包含秒）用于下次恢复
+          if (_restStartTime != null) {
+            // 保存当前完整的摸鱼时长（包含秒）用于下次恢复
+            _lastRestDuration = _restDuration;
+            
+            // 仍然以分钟精度保存到SharedPreferences
+            final restMinutes = _restDuration.inMinutes;
+            _settingsService.setDailyRestMinutes(dateStr, restMinutes);
+            
+            _restStartTime = null;
+            // 保存摸鱼时长
+            _saveRestDuration();
+          }
+          break;
+        case WorkStatus.offWork:
+          // 下班中 -> 加班中
+          _isManualOvertime = true;
+          _currentStatus = WorkStatus.overtime;
+          // 使用上次保存的完整时长（包含秒）
+          _overtimeDuration = _lastOvertimeDuration;
+          // 记录加班开始时间为当前时间
+          _overtimeStartTime = now;
+          // 立即保存加班时长，避免意外退出导致状态丢失
+          _saveOvertimeDuration();
+          // 启动高频率更新当前时薪
+          _startHighFrequencyHourlyRateUpdate();
+          break;
+        case WorkStatus.overtime:
+          // 加班中 -> 下班中
+          _isManualOvertime = false;
+          _currentStatus = WorkStatus.offWork;
+          // 保存加班时长但不重置，以便下次继续累计
+          if (_overtimeStartTime != null) {
+            // 保存当前完整的加班时长（包含秒）用于下次恢复
+            _lastOvertimeDuration = _overtimeDuration;
+            
+            // 仍然以分钟精度保存到SharedPreferences
+            final overtimeMinutes = now.difference(_overtimeStartTime!).inMinutes;
+            final previousOvertimeMinutes = _settingsService.getOvertimeMinutes(dateStr);
+            final totalOvertimeMinutes = previousOvertimeMinutes + overtimeMinutes;
+            _settingsService.setOvertimeMinutes(dateStr, totalOvertimeMinutes);
+            
+            _overtimeStartTime = null;
+            // 保存加班时长
+            _saveOvertimeDuration();
+            // 停止高频率更新当前时薪
+            _stopHighFrequencyHourlyRateUpdate();
+          }
+          break;
+      }
+    });
+  }
+
+  void _handleRestDurationUpdate(Duration duration) {
+    // 更新_restDuration变量，专用于外部传入的累计时长
+    _restDuration = duration;
+    
+    // 仅在分钟数变化时更新存储（仍然只存储分钟精度到SharedPreferences）
+    final now = _timeService.now();
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final storedMinutes = _settingsService.getDailyRestMinutes(dateStr);
+    
+    if (duration.inMinutes != storedMinutes) {
+      _settingsService.setDailyRestMinutes(dateStr, duration.inMinutes);
+    }
+  }
+
+  void _updateOvertimeDuration() {
+    if (_currentStatus == WorkStatus.overtime && _overtimeStartTime != null) {
+      final now = _timeService.now();
+      
+      // 计算当前加班会话的时长
+      final currentSessionDuration = now.difference(_overtimeStartTime!);
+      
+      // 我们在开始加班时已经将_overtimeDuration设置为累计值（包含秒精度）
+      // 因此这里只需要处理当前会话的增量即可
+      final newOvertimeDuration = _lastOvertimeDuration + currentSessionDuration;
+      
+      // 只有当加班时长有变化时才更新UI
+      if (newOvertimeDuration.inSeconds != _overtimeDuration.inSeconds) {
+        setState(() {
+          _overtimeDuration = newOvertimeDuration;
+        });
+        
+        // 仅在分钟数变化时更新存储（仍然只存储分钟精度到SharedPreferences）
+        final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+        if (newOvertimeDuration.inMinutes != _settingsService.getOvertimeMinutes(dateStr)) {
+          _settingsService.setOvertimeMinutes(dateStr, newOvertimeDuration.inMinutes);
+        }
+      }
+    }
+  }
+
+  // 添加方法来更新摸鱼时长，与加班时长更新类似
+  void _updateRestDuration() {
+    if (_currentStatus == WorkStatus.resting && _restStartTime != null) {
+      final now = _timeService.now();
+      
+      // 计算当前摸鱼会话的时长
+      final currentSessionDuration = now.difference(_restStartTime!);
+      
+      // 总摸鱼时长 = 上次保存的时长 + 当前会话时长
+      final newRestDuration = _lastRestDuration + currentSessionDuration;
+      
+      // 只有当摸鱼时长有变化时才传递更新
+      if (newRestDuration.inSeconds != _restDuration.inSeconds) {
+        _restDuration = newRestDuration;
+        
+        // 通知RestTimer组件更新显示
+        if (_currentStatus == WorkStatus.resting) {
+          // 不直接在这里调用setState，让RestTimer组件自己处理UI更新
+          _handleRestDurationUpdate(_restDuration);
+        }
+      }
+    }
+  }
+
+  // 添加方法来更新当前时薪
+  void _updateCurrentHourlyRate() {
+    if (_currentStatus == WorkStatus.overtime) {
+      final now = _timeService.now();
+      
+      // 计算实际工作开始时间
+      final startDateTime = DateTime(
+        now.year,
+        now.month,
+        now.day,
+        _startTime.hour,
+        _startTime.minute,
+      );
+      
+      // 计算总工作时长（分钟）
+      final totalWorkMinutes = now.difference(startDateTime).inMinutes;
+      
+      // 计算今日总收入
+      final todayEarnings = SalaryCalculator.calculateTodayEarnings(
+        currentTime: now,
+        startTime: _startTime,
+        endTime: _endTime,
+        salaryType: _salaryType,
+        salary: _salary,
+      );
+      
+      // 计算实际时薪（包含加班的实际表现）
+      final hourlyRate = totalWorkMinutes > 0
+        ? (todayEarnings / totalWorkMinutes * 60)
+        : _settingsService.getHourlySalary();
+        
+      // 更新通知器，触发UI更新
+      if (hourlyRate != _currentRate.value) {
+        _currentRate.value = hourlyRate;
+      }
+    }
+  }
+
+  // 在状态变为加班时启动高频率更新
+  void _startHighFrequencyHourlyRateUpdate() {
+    // 取消之前的定时器（如果存在）
+    _hourlyRateUpdateTimer?.cancel();
+    
+    // 创建新的高频率定时器 - 每16毫秒更新一次（约60FPS）
+    _hourlyRateUpdateTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
+      _updateCurrentHourlyRate();
+    });
+  }
+  
+  // 在状态不是加班时停止高频率更新
+  void _stopHighFrequencyHourlyRateUpdate() {
+    _hourlyRateUpdateTimer?.cancel();
+    _hourlyRateUpdateTimer = null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 在build方法中直接计算最新的收入数据
+    final todayEarnings = SalaryCalculator.calculateTodayEarnings(
+      currentTime: _timeService.now(),
+      startTime: _startTime,
+      endTime: _endTime,
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+    
+    final restEarnings = SalaryCalculator.calculateRestEarnings(
+      restDuration: _restDuration,
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('牛马'),
+        actions: [
+          // 添加数据隐藏/显示切换按钮
+          IconButton(
+            icon: Icon(_isDataHidden ? Icons.visibility_off : Icons.visibility),
+            onPressed: () {
+              setState(() {
+                _isDataHidden = !_isDataHidden;
+              });
+            },
+            tooltip: _isDataHidden ? '显示数据' : '隐藏数据',
+          ),
+          if (EnvConfig.isDev)
+            IconButton(
+              icon: const Icon(Icons.access_time),
+              onPressed: _showTimeControlDialog,
+            ),
+          IconButton(
+            icon: const Icon(Icons.download),
+            onPressed: _showExportConfirmDialog,
+          ),
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () {
+              Navigator.pushNamed(context, '/settings');
+            },
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: _handleRefresh,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            if (EnvConfig.isDev) _buildMockTimeDisplay(),
+            _buildStatusCard(),
+            const SizedBox(height: 16),
+            // 使用最新计算的数据构建收入部分
+            _buildEarningsSection(todayEarnings: todayEarnings, restEarnings: restEarnings),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // 下拉刷新处理函数
+  Future<void> _handleRefresh() async {
+    // 显示刷新消息
+    _showMessage('正在刷新数据...');
+    
+    // 加载最新设置
+    await _loadSettings();
+    
+    // 更新工作状态和统计数据
+    _updateStatus();
+    _updateTodayEarnings();
+    _updateOvertimeDuration();
+    _updateRestDuration();
+    _updateCurrentHourlyRate();
+    
+    // 如果是开发环境，重置模拟时间为实际时间
+    if (EnvConfig.isDev) {
+      _timeService.resetToRealTime();
+    }
+    
+    // 显示刷新完成消息
+    _showMessage('数据已刷新');
+    
+    // 等待一小段时间以确保UI更新
+    return Future.delayed(const Duration(milliseconds: 500));
+  }
+
+  Widget _buildMockTimeDisplay() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+      decoration: BoxDecoration(
+        color: Colors.amber[100],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.amber),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.warning, color: Colors.orange, size: 20),
+          const SizedBox(width: 8),
+          StreamBuilder(
+            stream: Stream.periodic(const Duration(seconds: 1)),
+            builder: (context, snapshot) {
+              final now = _timeService.now();
+              return Text(
+                '模拟时间：${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')} '
+                '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}',
+                style: const TextStyle(
+                  color: Colors.black87,
+                  fontWeight: FontWeight.w500,
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(24),
+      constraints: const BoxConstraints(
+        minHeight: 400,  // 设置固定最小高度
+      ),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.1),
+            spreadRadius: 1,
+            blurRadius: 10,
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,  // 在顶部和底部之间均匀分布
+        children: [
+          Text(
+            _getStatusTitle(),
+            style: const TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          _buildStatusContent(),  // 中间内容
+          SizedBox(  // 固定按钮容器大小
+            width: 200,
+            height: 45,
+            child: ElevatedButton(
+              onPressed: _handleStatusButtonPressed,
+              child: Text(_getButtonText()),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusContent() {
+    switch (_currentStatus) {
+      case WorkStatus.working:
+        return SizedBox(
+          height: 245,  // 增加高度，解决3像素溢出问题
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,  // 使列尽可能小
+              children: [
+                Flexible(  // 使WorkTimer可伸缩
+                  child: WorkTimer(
+                    startTime: _startTime,
+                    endTime: _endTime,
+                  ),
+                ),
+                const SizedBox(height: 8),  // 再减小间距
+                StreamBuilder(
+                  stream: Stream.periodic(const Duration(seconds: 1)),
+                  builder: (context, snapshot) {
+                    final now = _timeService.now();
+                    final endDateTime = DateTime(
+                      now.year, 
+                      now.month, 
+                      now.day, 
+                      _endTime.hour, 
+                      _endTime.minute
+                    );
+                    
+                    // 如果已经过了下班时间，显示0
+                    var remainingDuration = now.isAfter(endDateTime) 
+                        ? Duration.zero 
+                        : endDateTime.difference(now);
+                    
+                    final hours = remainingDuration.inHours;
+                    final minutes = remainingDuration.inMinutes % 60;
+                    final seconds = remainingDuration.inSeconds % 60;
+                    
+                    return Text(
+                      '距离下班还有 $hours小时$minutes分',
+                      style: TextStyle(
+                        fontSize: 13,  // 进一步减小字体大小
+                        color: Colors.grey[600],
+                        fontWeight: FontWeight.w500,
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      case WorkStatus.resting:
+        // 计算当前摸鱼收入
+        final restEarnings = SalaryCalculator.calculateRestEarnings(
+          restDuration: _restDuration,
+          salaryType: _salaryType,
+          salary: _salary,
+        );
+        
+        // 使用导入的getRandomRestEarningMessage方法获取文案
+        final messageText = getRandomRestEarningMessage(restEarnings);
+        
+        return SizedBox(
+          height: 290, // 增加高度以确保容纳所有内容，原来是280，再增加10像素
+          child: Center(
+            child: RestTimer(
+              isResting: true,
+              accumulatedTime: _restDuration,
+              onTimeUpdate: _handleRestDurationUpdate,
+              salaryType: _salaryType,
+              salary: _salary,
+              isDataHidden: _isDataHidden,
+              messageText: messageText, // 传递随机文案
+            ),
+          ),
+        );
+      case WorkStatus.overtime:
+        // 获取加班文案
+        final messageText = getRandomOvertimeMessage(_overtimeDuration);
+        
+        return SizedBox(
+          height: 240,
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.psychology_alt, 
+                  size: 48, 
+                  color: AppTheme.primaryColor
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  '${_overtimeDuration.inHours.toString().padLeft(2, '0')}:${(_overtimeDuration.inMinutes % 60).toString().padLeft(2, '0')}:${(_overtimeDuration.inSeconds % 60).toString().padLeft(2, '0')}',
+                  style: const TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black87,
+                  ),
+                ),
+                // 添加显示加班文案的容器
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.primaryColor.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Text(
+                    messageText,
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: AppTheme.primaryColor,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    textAlign: TextAlign.left,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      case WorkStatus.offWork:
+        // 计算今日摸鱼收入
+        final restEarnings = SalaryCalculator.calculateRestEarnings(
+          restDuration: _restDuration,
+          salaryType: _salaryType,
+          salary: _salary,
+        );
+        
+        // 计算摸鱼收入占比
+        final percentage = _todayEarnings.value > 0 
+          ? (restEarnings / _todayEarnings.value * 100).toStringAsFixed(1)
+          : '0.0';
+        
+        return SizedBox(
+          height: 240,
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // 减小顶部间距，让图标更靠近标题
+                const SizedBox(height: 8),
+                // sprint图标放在进度条上方
+                Icon(
+                  Icons.directions_run,
+                  size: 48,
+                  color: AppTheme.primaryColor,
+                ),
+                // 增加图标到进度条的间距
+                const SizedBox(height: 32),
+                SizedBox(
+                  width: 200,
+                  child: LinearProgressIndicator(
+                    value: _todayEarnings.value > 0 ? restEarnings / _todayEarnings.value : 0,
+                    backgroundColor: Colors.grey[200],
+                    color: AppTheme.primaryColor,
+                    minHeight: 10,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Text(
+                  // 不再使用数据隐藏功能，始终显示真实百分比
+                '今日收入$percentage%为摸鱼所得哦~',
+                  style: const TextStyle(
+                    fontSize: 16,
+                    color: Colors.grey,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+    }
+  }
+
+  Widget _buildEarningsSection({required double todayEarnings, required double restEarnings}) {
+    // 计算正常工作时长（分钟）
+    final now = _timeService.now();
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    
+    // 获取今日加班时长(用于其他计算，不再用于时薪计算)
+    final overtimeMinutes = _currentStatus == WorkStatus.overtime
+        ? _overtimeDuration.inMinutes
+        : _settingsService.getOvertimeMinutes(dateStr);
+
+    // 计算标准工作时长（分钟）
+    final workStartDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _startTime.hour,
+      _startTime.minute,
+    );
+    
+    final workEndDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
+    
+    final standardWorkMinutes = workEndDateTime.difference(workStartDateTime).inMinutes;
+    
+    // 计算总工作时长（标准工作时长+加班时长）(分钟)
+    final totalWorkMinutes = standardWorkMinutes + overtimeMinutes;
+    
+    // 计算实际时薪 - 今日搬砖/（上班时长+加班时长）
+    double hourlyRate;
+    if (totalWorkMinutes > 0) {
+      // 将分钟转换为小时，计算实际时薪
+      hourlyRate = todayEarnings / (totalWorkMinutes / 60);
+    } else {
+      // 如果没有工作时长，使用标准时薪
+      hourlyRate = _salaryType == '时薪'
+        ? _salary
+        : _settingsService.getHourlySalary();
+    }
+
+    // 计算今年搬砖收入（历史数据）
+    final yearToDateEarnings = SalaryCalculator.calculateYearToDateEarnings(
+      currentTime: _timeService.now(),
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+
+    // 计算本周摸鱼收入
+    final weekRestEarnings = SalaryCalculator.calculateWeekRestEarnings(
+      currentTime: _timeService.now(),
+      todayRestDuration: _restDuration,
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+
+    // 判断是否应该置灰
+    bool shouldGrayOutTodayEarnings = _currentStatus == WorkStatus.offWork || 
+        (_currentStatus == WorkStatus.overtime);
+    
+    // 修改：使今日摸鱼卡片在下班中和加班中状态下置灰
+    bool shouldGrayOutRestEarnings = _currentStatus == WorkStatus.offWork || 
+        (_currentStatus == WorkStatus.overtime);
+        
+    // 修改：时薪卡片在加班中状态下不置灰
+    bool shouldGrayOutHourlyRate = _currentStatus == WorkStatus.offWork;
+
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: RealtimeEarningsCard(
+                title: '今日搬砖',
+                amountCalculator: () => SalaryCalculator.calculateTodayEarnings(
+                  currentTime: _timeService.now(),
+                  startTime: _startTime,
+                  endTime: _endTime,
+                  salaryType: _salaryType,
+                  salary: _salary,
+                ),
+                shouldGrayOut: shouldGrayOutTodayEarnings,
+                timeService: _timeService,
+                isDataHidden: _isDataHidden,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: RealtimeEarningsCard(
+                title: '今日摸鱼',
+                amountCalculator: () => SalaryCalculator.calculateRestEarnings(
+                  restDuration: _restDuration,
+                  salaryType: _salaryType,
+                  salary: _salary,
+                ),
+                shouldGrayOut: shouldGrayOutRestEarnings,
+                timeService: _timeService,
+                isDataHidden: _isDataHidden,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            Expanded(
+              flex: 1,
+              child: _buildEarningsCard('今年搬砖(不含今日)', yearToDateEarnings),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 1,
+              child: _currentStatus == WorkStatus.overtime 
+                // 加班状态下，使用实时计算的时薪
+                ? RealtimeEarningsCard(
+                    title: '今日时薪',
+                    amountCalculator: () {
+                      // 重新计算实时时薪
+                      final now = _timeService.now();
+                      final currentOvertimeMinutes = _currentStatus == WorkStatus.overtime
+                          ? _overtimeDuration.inMinutes
+                          : _settingsService.getOvertimeMinutes(dateStr);
+                      
+                      final totalWorkMinutes = standardWorkMinutes + currentOvertimeMinutes;
+                      
+                      if (totalWorkMinutes > 0) {
+                        final currentTodayEarnings = SalaryCalculator.calculateTodayEarnings(
+                          currentTime: now,
+                          startTime: _startTime,
+                          endTime: _endTime,
+                          salaryType: _salaryType,
+                          salary: _salary,
+                        );
+                        return currentTodayEarnings / (totalWorkMinutes / 60);
+                      } else {
+                        return _salaryType == '时薪'
+                          ? _salary
+                          : _settingsService.getHourlySalary();
+                      }
+                    },
+                    shouldGrayOut: false,
+                    timeService: _timeService,
+                    isDataHidden: _isDataHidden,
+                  )
+                // 非加班状态，使用普通卡片
+                : _buildEarningsCard('今日时薪', hourlyRate, shouldGrayOut: shouldGrayOutHourlyRate),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 1,
+              child: _buildEarningsCard('本周摸鱼(不含今日)', weekRestEarnings),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEarningsCard(String title, double amount, {bool? shouldGrayOut}) {
+    // 下班状态和加班状态时的置灰效果，现在包括今日时薪在内的所有非摸鱼卡片都会置灰
+    final bool shouldGrayOutCard = shouldGrayOut ?? (_currentStatus == WorkStatus.offWork || 
+        (_currentStatus == WorkStatus.overtime)); // 在下班和加班状态下置灰所有卡片
+    
+    final Color backgroundColor = shouldGrayOutCard ? Colors.grey[100]! : Colors.white;
+    final Color textColor = shouldGrayOutCard ? Colors.grey[500]! : Colors.grey;
+    final Color amountColor = shouldGrayOutCard ? Colors.grey[600]! : Colors.black87;
+    
+    // 获取金额文本，根据隐藏状态决定是否显示星号
+    final String amountText = _isDataHidden ? '¥*****.**' : _formatAmount(amount);
+    
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.1),
+            spreadRadius: 1,
+            blurRadius: 5,
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              color: textColor,
+              fontSize: 14,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            amountText,
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              color: amountColor,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _getStatusTitle() {
+    switch (_currentStatus) {
+      case WorkStatus.working:
+        return '搬砖中';
+      case WorkStatus.resting:
+        return '摸鱼中';
+      case WorkStatus.offWork:
+        return '下班中';
+      case WorkStatus.overtime:
+        return '加班中';
+    }
+  }
+
+  String _getButtonText() {
+    switch (_currentStatus) {
+      case WorkStatus.working:
+        return '开始摸鱼';
+      case WorkStatus.resting:
+        return '结束摸鱼';
+      case WorkStatus.offWork:
+        return '开始加班';
+      case WorkStatus.overtime:
+        return '结束加班';
+    }
+  }
+
+  String _getTimeDisplay() {
+    return '10:00:00';
+  }
+
+  void _showTimeControlDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => TimeControlDialog(
+        initialTime: _timeService.now(),
+        onTimeSelected: (dateTime) {
+          _timeService.setMockTime(dateTime);
+          _updateStatus();
+        },
+      ),
+    );
+  }
+
+  // 保存每日数据
+  Future<void> _saveDailyData(String dateStr) async {
+    // 计算并保存今日搬砖收入
+    final todayEarnings = SalaryCalculator.calculateTodayEarnings(
+      currentTime: _timeService.now(),
+      startTime: _startTime,
+      endTime: _endTime,
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+    await _settingsService.setDailyEarnings(dateStr, todayEarnings);
+    
+    // 计算并保存今日摸鱼收入
+    final restEarnings = SalaryCalculator.calculateRestEarnings(
+      restDuration: _restDuration,
+      salaryType: _salaryType,
+      salary: _salary,
+    );
+    await _settingsService.setDailyRestEarnings(dateStr, restEarnings);
+    
+    // 保存今日摸鱼时长和加班时长
+    await _settingsService.setDailyRestMinutes(dateStr, _restDuration.inMinutes);
+    await _settingsService.setOvertimeMinutes(dateStr, _overtimeDuration.inMinutes);
+    
+    // 保存当天的上班时间
+    await _settingsService.setDailyStartTime(dateStr, _startTime);
+    
+    // 获取并保存实际下班时间（考虑加班情况）
+    final actualEndTime = _getActualEndTime(dateStr);
+    final actualEndTimeOfDay = TimeOfDay(hour: actualEndTime.hour, minute: actualEndTime.minute);
+    await _settingsService.setDailyEndTime(dateStr, actualEndTimeOfDay);
+    
+    // 计算实际工作时长（包含加班）
+    final workStartDateTime = DateTime(
+      actualEndTime.year,
+      actualEndTime.month,
+      actualEndTime.day,
+      _startTime.hour,
+      _startTime.minute,
+    );
+    
+    // 计算实际工作分钟数（包含加班时间）
+    final workDurationMinutes = actualEndTime.difference(workStartDateTime).inMinutes;
+    await _settingsService.setDailyWorkMinutes(dateStr, workDurationMinutes);
+    
+    // 计算并保存时薪（今日搬砖/(下班时间-上班时间)）
+    double hourlyRate;
+    if (workDurationMinutes > 0) {
+      // 将工作分钟转换为小时，计算实际时薪
+      hourlyRate = todayEarnings / (workDurationMinutes / 60);
+    } else {
+      // 如果工作时长为0，使用标准时薪
+      hourlyRate = _salaryType == '时薪'
+        ? _salary
+        : _settingsService.getHourlySalary();
+    }
+    await _settingsService.setDailyHourlyRate(dateStr, hourlyRate);
+    
+    // 更新最后保存日期
+    _lastSavedDailyDataDate = dateStr;
+    
+    print('已保存${dateStr}的收入数据和工作时间数据（包含加班）');
+  }
+
+  // 添加导出确认对话框
+  void _showExportConfirmDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('导出确认'),
+        content: const Text('确认导出我的数据？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _exportData();
+            },
+            child: const Text('确认导出'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 导出数据功能
+  Future<void> _exportData() async {
+    try {
+      // 请求存储权限
+      var status = await Permission.storage.status;
+      if (!status.isGranted) {
+        status = await Permission.storage.request();
+        if (!status.isGranted) {
+          _showMessage('需要存储权限才能导出数据');
+          return;
+        }
+      }
+
+      // 显示加载指示器
+      _showLoadingDialog();
+
+      // 创建Excel文件
+      final excel = Excel.createExcel();
+      final sheet = excel['工作数据'];
+
+      // 格式化Excel文件表头
+      final headers = ['日期', '上班时间', '实际下班时间', '实际工作时长', '加班时长', '今日搬砖', '今日摸鱼', '实际时薪'];
+      for (var i = 0; i < headers.length; i++) {
+        sheet.cell(CellIndex.indexByColumnRow(columnIndex: i, rowIndex: 0)).value = headers[i];
+      }
+
+      // 获取当前日期
+      final now = _timeService.now();
+      final today = DateTime(now.year, now.month, now.day);
+      
+      // 收集历史数据 - 从当前日期倒序收集30天数据
+      var rowIndex = 1;
+      for (var i = 1; i <= 30; i++) {
+        final date = today.subtract(Duration(days: i));
+        final dateStr = '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+        
+        // 获取数据
+        final dailyEarnings = _settingsService.getDailyEarnings(dateStr);
+        final dailyRestEarnings = _settingsService.getDailyRestEarnings(dateStr);
+        final overtimeMinutes = _settingsService.getOvertimeMinutes(dateStr);
+        final restMinutes = _settingsService.getDailyRestMinutes(dateStr);
+        final dailyWorkMinutes = _settingsService.getDailyWorkMinutes(dateStr);
+        
+        // 检查是否有数据 - 只有有数据的日期才添加到表格中
+        final hasData = dailyEarnings > 0 || 
+                        dailyRestEarnings > 0 || 
+                        overtimeMinutes > 0 || 
+                        restMinutes > 0 ||
+                        dailyWorkMinutes > 0;
+        
+        if (hasData) {
+          // 获取每日保存的上班时间、下班时间和时薪
+          final dailyStartTime = _settingsService.getDailyStartTime(dateStr);
+          final dailyEndTime = _settingsService.getDailyEndTime(dateStr);
+          final dailyHourlyRate = _settingsService.getDailyHourlyRate(dateStr);
+          
+          // 使用存储的工作时长，而不是重新计算
+          final workDurationMinutes = dailyWorkMinutes;
+          
+          // 格式化数据
+          final formattedDate = DateFormat('yyyy-MM-dd').format(date);
+          final formattedStartTime = '${dailyStartTime.hour.toString().padLeft(2, '0')}:${dailyStartTime.minute.toString().padLeft(2, '0')}';
+          final formattedEndTime = '${dailyEndTime.hour.toString().padLeft(2, '0')}:${dailyEndTime.minute.toString().padLeft(2, '0')}';
+          final formattedWorkDuration = '${(workDurationMinutes ~/ 60).toString()}小时${(workDurationMinutes % 60).toString()}分钟';
+          final formattedOvertimeDuration = '${(overtimeMinutes ~/ 60).toString()}小时${(overtimeMinutes % 60).toString()}分钟';
+          
+          // 添加行数据
+          final rowData = [
+            formattedDate,
+            formattedStartTime,
+            formattedEndTime,
+            formattedWorkDuration,
+            formattedOvertimeDuration,
+            '¥${dailyEarnings.toStringAsFixed(2)}',
+            '¥${dailyRestEarnings.toStringAsFixed(2)}',
+            '¥${dailyHourlyRate.toStringAsFixed(2)}'
+          ];
+          
+          for (var j = 0; j < rowData.length; j++) {
+            sheet.cell(CellIndex.indexByColumnRow(columnIndex: j, rowIndex: rowIndex)).value = rowData[j];
+          }
+          rowIndex++;
+        }
+      }
+
+      // 格式化当前日期用于文件名
+      final dateFormatter = DateFormat('yyyyMMdd');
+      final formattedDate = dateFormatter.format(now);
+      final fileName = 'niuma$formattedDate.xlsx';
+
+      // 获取临时目录用于保存文件
+      final directory = await getTemporaryDirectory();
+      final filePath = '${directory.path}/$fileName';
+      
+      // 保存Excel文件
+      final fileBytes = excel.encode();
+      if (fileBytes != null) {
+        final file = File(filePath);
+        await file.writeAsBytes(fileBytes);
+        
+        // 关闭加载对话框
+        Navigator.of(context).pop();
+        
+        // 显示分享对话框，让用户可以选择保存到哪里或分享到其他应用
+        await Share.shareXFiles(
+          [XFile(filePath)],
+          subject: '牛马工作数据导出 $formattedDate',
+        );
+        
+        // 显示导出成功提示
+        _showMessage('导出成功，Excel文件已生成');
+      } else {
+        // 关闭加载对话框
+        Navigator.of(context).pop();
+        _showMessage('导出失败: 无法生成文件');
+      }
+    } catch (e) {
+      // 关闭加载对话框
+      if (context.mounted) {
+        Navigator.of(context).pop();
+      }
+      _showMessage('导出失败: $e');
+    }
+  }
+
+  // 显示加载对话框
+  void _showLoadingDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return Dialog(
+          child: Container(
+            padding: const EdgeInsets.all(20),
+            constraints: const BoxConstraints(maxWidth: 300),
+            child: const Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('正在导出数据...'),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // 显示消息提示
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  // 定期保存摸鱼和加班时长，避免应用被杀死后数据丢失
+  void _saveRestStateIfNeeded() {
+    final now = _timeService.now();
+    // 每60秒保存一次当前摸鱼时长，避免频繁写入
+    if (_currentStatus == WorkStatus.resting && now.second == 0) {
+      _saveRestDuration();
+    }
+    
+    // 每60秒保存一次当前加班时长，避免频繁写入
+    if (_currentStatus == WorkStatus.overtime && now.second == 0) {
+      _saveOvertimeDuration();
+    }
+  }
+
+  // 保存摸鱼时长到持久化存储
+  Future<void> _saveRestDuration() async {
+    final prefs = await SharedPreferences.getInstance();
+    final now = _timeService.now();
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    
+    // 只保存当前摸鱼累计时长（毫秒级精度）
+    await prefs.setInt(_lastRestDurationKey, _restDuration.inMilliseconds);
+    
+    // 同时以分钟精度更新每日摸鱼时长（用于历史统计）
+    await _settingsService.setDailyRestMinutes(dateStr, _restDuration.inMinutes);
+  }
+  
+  // 保存加班时长到持久化存储
+  Future<void> _saveOvertimeDuration() async {
+    final prefs = await SharedPreferences.getInstance();
+    final now = _timeService.now();
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    
+    // 只保存当前加班累计时长（毫秒级精度）
+    await prefs.setInt(_lastOvertimeDurationKey, _overtimeDuration.inMilliseconds);
+    
+    // 同时以分钟精度更新每日加班时长（用于历史统计）
+    await _settingsService.setOvertimeMinutes(dateStr, _overtimeDuration.inMinutes);
+  }
+
+  // 恢复上次的时长数据
+  Future<void> _restoreRestState() async {
+    final prefs = await SharedPreferences.getInstance();
+    
+    // 恢复摸鱼累计时长
+    final lastRestDurationMillis = prefs.getInt(_lastRestDurationKey) ?? 0;
+    _lastRestDuration = Duration(milliseconds: lastRestDurationMillis);
+    _restDuration = _lastRestDuration;
+    
+    // 恢复加班累计时长
+    final lastOvertimeDurationMillis = prefs.getInt(_lastOvertimeDurationKey) ?? 0;
+    _lastOvertimeDuration = Duration(milliseconds: lastOvertimeDurationMillis);
+    _overtimeDuration = _lastOvertimeDuration;
+    
+    // 清除状态标记
+    _isManualResting = false;
+    _restStartTime = null;
+    _isManualOvertime = false;
+    _overtimeStartTime = null;
+    
+    // 保存更新后的状态，确保状态被重置
+    await prefs.setBool(_isRestingKey, false);
+    await prefs.remove(_restStartTimeKey);
+    await prefs.setBool(_isOvertimeKey, false);
+    await prefs.remove(_overtimeStartTimeKey);
+    
+    // 根据当前时间判断是工作中还是下班中
+    final now = _timeService.now();
+    final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
+    final isHoliday = _holidayService.isHoliday(now);
+    final isSpecialWorkDay = _holidayService.isWorkday(now);
+    final isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
+    final isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
+    final isWorkTime = _isWithinWorkTime(currentTimeOfDay);
+    
+    // 在下一帧设置状态，避免在initState中调用setState
+    Future.microtask(() {
+      if (mounted) {
+        setState(() {
+          if (isWorkDay && isWorkTime) {
+            _currentStatus = WorkStatus.working; // 工作日上班时间 -> 搬砖中
+          } else {
+            _currentStatus = WorkStatus.offWork; // 非工作时间 -> 下班中
+          }
+        });
+      }
+    });
+  }
+
+  // 格式化金额的辅助方法
+  String _formatAmount(double amount) {
+    // 如果数据隐藏状态为true，则返回隐藏的金额显示
+    if (_isDataHidden) {
+      return '¥*****.**';
+    }
+    
+    final formattedAmount = amount.toStringAsFixed(2);
+    final parts = formattedAmount.split('.');
+    final wholePart = parts[0].replaceAllMapped(
+      RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
+      (match) => '${match[1]},',
+    );
+    final decimalPart = parts[1];
+    return '¥$wholePart.$decimalPart';
+  }
+}
+
+// 添加一个新的实时更新收入卡片组件
+class RealtimeEarningsCard extends StatefulWidget {
+  final String title;
+  final Function() amountCalculator;
+  final bool shouldGrayOut;
+  final TimeService timeService;
+  final bool isDataHidden;
+
+  const RealtimeEarningsCard({
+    Key? key,
+    required this.title,
+    required this.amountCalculator,
+    required this.shouldGrayOut,
+    required this.timeService,
+    required this.isDataHidden,
+  }) : super(key: key);
+
+  @override
+  State<RealtimeEarningsCard> createState() => _RealtimeEarningsCardState();
+}
+
+class _RealtimeEarningsCardState extends State<RealtimeEarningsCard> {
+  late Timer _updateTimer;
+  late ValueNotifier<double> _amountNotifier;
+
+  @override
+  void initState() {
+    super.initState();
+    _amountNotifier = ValueNotifier<double>(widget.amountCalculator());
+    
+    // 更高频率更新金额 - 每16毫秒更新一次 (约60FPS)
+    _updateTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
+      final newAmount = widget.amountCalculator();
+      if (newAmount != _amountNotifier.value) {
+        _amountNotifier.value = newAmount;
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _updateTimer.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final Color backgroundColor = widget.shouldGrayOut ? Colors.grey[100]! : Colors.white;
+    final Color textColor = widget.shouldGrayOut ? Colors.grey[500]! : Colors.grey;
+    final Color amountColor = widget.shouldGrayOut ? Colors.grey[600]! : Colors.black87;
+    
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.1),
+            spreadRadius: 1,
+            blurRadius: 5,
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            widget.title,
+            style: TextStyle(
+              color: textColor,
+              fontSize: 14,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ValueListenableBuilder<double>(
+            valueListenable: _amountNotifier,
+            builder: (context, amount, child) {
+              return Text(
+                _formatAmount(amount),
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: amountColor,
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 格式化金额的辅助方法
+  String _formatAmount(double amount) {
+    // 如果数据隐藏状态为true，则返回隐藏的金额显示
+    if (widget.isDataHidden) {
+      return '¥*****.**';
+    }
+    
+    final formattedAmount = amount.toStringAsFixed(2);
+    final parts = formattedAmount.split('.');
+    final wholePart = parts[0].replaceAllMapped(
+      RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
+      (match) => '${match[1]},',
+    );
+    final decimalPart = parts[1];
+    return '¥$wholePart.$decimalPart';
+  }
+} 
