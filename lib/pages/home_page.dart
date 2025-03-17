@@ -505,6 +505,16 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
       if (hourlyRate != _currentRate.value) {
         _currentRate.value = hourlyRate;
       }
+    } else if (_currentStatus == WorkStatus.working || _currentStatus == WorkStatus.resting) {
+      // 搬砖中或摸鱼中状态下，使用标准时薪
+      final standardHourlyRate = _salaryType == '时薪'
+        ? _salary
+        : _settingsService.getHourlySalary();
+        
+      // 更新通知器，触发UI更新
+      if (standardHourlyRate != _currentRate.value) {
+        _currentRate.value = standardHourlyRate;
+      }
     }
   }
 
@@ -902,14 +912,24 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     
     // 计算实际时薪 - 今日搬砖/（上班时长+加班时长）
     double hourlyRate;
-    if (totalWorkMinutes > 0) {
-      // 将分钟转换为小时，计算实际时薪
-      hourlyRate = todayEarnings / (totalWorkMinutes / 60);
-    } else {
-      // 如果没有工作时长，使用标准时薪
+    
+    // 修改：搬砖中和摸鱼中状态下，使用标准时薪，不再实时计算
+    if (_currentStatus == WorkStatus.working || _currentStatus == WorkStatus.resting) {
+      // 直接使用用户设置的标准时薪
       hourlyRate = _salaryType == '时薪'
         ? _salary
         : _settingsService.getHourlySalary();
+    } else {
+      // 加班中和下班中状态，使用原有计算逻辑
+      if (totalWorkMinutes > 0) {
+        // 将分钟转换为小时，计算实际时薪
+        hourlyRate = todayEarnings / (totalWorkMinutes / 60);
+      } else {
+        // 如果没有工作时长，使用标准时薪
+        hourlyRate = _salaryType == '时薪'
+          ? _salary
+          : _settingsService.getHourlySalary();
+      }
     }
 
     // 计算今年搬砖收入（历史数据）
@@ -996,6 +1016,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
                       
                       final totalWorkMinutes = standardWorkMinutes + currentOvertimeMinutes;
                       
+                      // 加班状态下，继续使用实时计算的时薪
                       if (totalWorkMinutes > 0) {
                         final currentTodayEarnings = SalaryCalculator.calculateTodayEarnings(
                           currentTime: now,
