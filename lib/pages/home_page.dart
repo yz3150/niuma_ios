@@ -75,6 +75,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   static const String _isOvertimeKey = 'is_overtime_state';
   static const String _overtimeStartTimeKey = 'overtime_start_time';
   static const String _lastOvertimeDurationKey = 'last_overtime_duration';
+  // 添加记录上次加班日期的键
+  static const String _lastOvertimeDateKey = 'last_overtime_date';
+  // 添加记录上次重置计时器的日期键
+  static const String _lastTimerResetDateKey = 'last_timer_reset_date';
 
   String? _lastSavedDailyDataDate; // 记录最后一次保存每日数据的日期
 
@@ -156,6 +160,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   void _updateStatus() {
     final now = _timeService.now();
     final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
+    final todayDateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     
     // 1. 检查是否是国家法定节假日
     final isHoliday = _holidayService.isHoliday(now);
@@ -175,6 +180,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 否则，周一至周五是工作日，周六日不是工作日
     final bool isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
     final bool isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
+    
+    // 检查是否需要重置所有计时器（上班时间到达时）
+    if (isWorkDay && _isAtStartTime(currentTimeOfDay)) {
+      _checkAndResetAllTimers(todayDateStr);
+    }
+    
+    // 检查今天是否是新的工作日，需要重置加班时长
+    _checkAndResetOvertimeDuration(isWorkDay, isWorkTime, todayDateStr);
     
     // 记录当前状态用于后续判断是否发生了状态变化
     final previousStatus = _currentStatus;
@@ -1430,15 +1443,56 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   Future<void> _restoreRestState() async {
     final prefs = await SharedPreferences.getInstance();
     
-    // 恢复摸鱼累计时长
-    final lastRestDurationMillis = prefs.getInt(_lastRestDurationKey) ?? 0;
-    _lastRestDuration = Duration(milliseconds: lastRestDurationMillis);
-    _restDuration = _lastRestDuration;
+    // 获取当前日期字符串
+    final now = _timeService.now();
+    final todayDateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
     
-    // 恢复加班累计时长
-    final lastOvertimeDurationMillis = prefs.getInt(_lastOvertimeDurationKey) ?? 0;
-    _lastOvertimeDuration = Duration(milliseconds: lastOvertimeDurationMillis);
-    _overtimeDuration = _lastOvertimeDuration;
+    // 检查今天是否已重置计时器，如果没有且当前是上班时间，则重置
+    final isHoliday = _holidayService.isHoliday(now);
+    final isSpecialWorkDay = _holidayService.isWorkday(now);
+    final isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
+    final isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
+    
+    if (isWorkDay && _isAtStartTime(currentTimeOfDay)) {
+      final lastResetDate = prefs.getString(_lastTimerResetDateKey);
+      if (lastResetDate != todayDateStr) {
+        // 重置所有计时器
+        await _checkAndResetAllTimers(todayDateStr);
+        print('应用启动时重置所有计时器 - 上班时间到');
+      }
+    }
+    
+    // 检查加班日期是否为今天，如果不是，重置加班时长
+    final lastOvertimeDate = prefs.getString(_lastOvertimeDateKey);
+    if (lastOvertimeDate != null && lastOvertimeDate != todayDateStr) {
+      // 重置加班累计时长
+      _lastOvertimeDuration = Duration.zero;
+      _overtimeDuration = Duration.zero;
+      
+      // 保存重置后的加班时长
+      await prefs.setInt(_lastOvertimeDurationKey, 0);
+      
+      print('应用启动时重置加班时长 - 新的一天开始');
+    } else {
+      // 如果是同一天，则恢复加班累计时长
+      final lastOvertimeDurationMillis = prefs.getInt(_lastOvertimeDurationKey) ?? 0;
+      _lastOvertimeDuration = Duration(milliseconds: lastOvertimeDurationMillis);
+      _overtimeDuration = _lastOvertimeDuration;
+    }
+    
+    // 如果计时器已重置，则不恢复摸鱼时长
+    final lastResetDate = prefs.getString(_lastTimerResetDateKey);
+    if (lastResetDate != todayDateStr) {
+      // 恢复摸鱼累计时长
+      final lastRestDurationMillis = prefs.getInt(_lastRestDurationKey) ?? 0;
+      _lastRestDuration = Duration(milliseconds: lastRestDurationMillis);
+      _restDuration = _lastRestDuration;
+    } else {
+      // 计时器已重置，使用零值
+      _lastRestDuration = Duration.zero;
+      _restDuration = Duration.zero;
+    }
     
     // 清除状态标记
     _isManualResting = false;
@@ -1453,12 +1507,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     await prefs.remove(_overtimeStartTimeKey);
     
     // 根据当前时间判断是工作中还是下班中
-    final now = _timeService.now();
-    final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
-    final isHoliday = _holidayService.isHoliday(now);
-    final isSpecialWorkDay = _holidayService.isWorkday(now);
-    final isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
-    final isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
     final isWorkTime = _isWithinWorkTime(currentTimeOfDay);
     
     // 在下一帧设置状态，避免在initState中调用setState
@@ -1490,6 +1538,74 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     );
     final decimalPart = parts[1];
     return '¥$wholePart.$decimalPart';
+  }
+
+  // 添加检查和重置所有计时器的方法
+  Future<void> _checkAndResetAllTimers(String todayDateStr) async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastResetDate = prefs.getString(_lastTimerResetDateKey);
+    
+    // 如果今天已经重置过，则不再重置
+    if (lastResetDate == todayDateStr) {
+      return;
+    }
+    
+    // 重置摸鱼时长
+    _lastRestDuration = Duration.zero;
+    _restDuration = Duration.zero;
+    
+    // 重置加班时长
+    _lastOvertimeDuration = Duration.zero;
+    _overtimeDuration = Duration.zero;
+    
+    // 保存重置后的时长
+    await prefs.setInt(_lastRestDurationKey, 0);
+    await prefs.setInt(_lastOvertimeDurationKey, 0);
+    
+    // 记录本次重置的日期
+    await prefs.setString(_lastTimerResetDateKey, todayDateStr);
+    
+    // 清除开始时间
+    _restStartTime = null;
+    _overtimeStartTime = null;
+    
+    // 更新UI
+    setState(() {
+      // 确保重置UI显示
+      if (_currentStatus == WorkStatus.resting) {
+        _currentStatus = WorkStatus.working;
+        _isManualResting = false;
+      } else if (_currentStatus == WorkStatus.overtime) {
+        _currentStatus = WorkStatus.offWork;
+        _isManualOvertime = false;
+        _stopHighFrequencyHourlyRateUpdate();
+      }
+    });
+    
+    print('上班时间到达：已重置所有计时器');
+  }
+
+  // 检查今天是否是新的工作日，需要重置加班时长
+  Future<void> _checkAndResetOvertimeDuration(bool isWorkDay, bool isWorkTime, String todayDateStr) async {
+    if (!isWorkDay || !isWorkTime) return;
+    
+    final prefs = await SharedPreferences.getInstance();
+    final lastOvertimeDate = prefs.getString(_lastOvertimeDateKey);
+
+    // 如果当前是工作日的上班时间，且上次加班日期与今天不同，则重置加班时长
+    if (lastOvertimeDate != null && lastOvertimeDate != todayDateStr) {
+      // 重置加班时长
+      _lastOvertimeDuration = Duration.zero;
+      _overtimeDuration = Duration.zero;
+      
+      // 保存重置后的加班时长
+      await prefs.setInt(_lastOvertimeDurationKey, 0);
+      
+      // 更新UI
+      setState(() {});
+      
+      print('已重置加班时长 - 新的一天开始');
+    }
   }
 }
 
