@@ -94,23 +94,31 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 恢复上次的摸鱼状态
     _restoreRestState();
     
+    // 清理可能存在的旧定时器
+    _timer?.cancel();
+    
     // 每秒更新状态和加班时长
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      _updateStatus();
-      _updateTodayEarnings();
-      _updateOvertimeDuration();
-      _updateRestDuration(); // 添加摸鱼时长更新
-      _updateCurrentHourlyRate(); // 添加当前时薪更新
-      _saveRestStateIfNeeded(); // 定期保存摸鱼时长
+      if (mounted) {
+        _updateStatus();
+        _updateTodayEarnings();
+        _updateOvertimeDuration();
+        _updateRestDuration(); // 添加摸鱼时长更新
+        _updateCurrentHourlyRate(); // 添加当前时薪更新
+        _saveRestStateIfNeeded(); // 定期保存摸鱼时长
+      }
     });
     
-    // 移除不必要的收入卡片定时器
+    print('初始化完成，定时器已启动');
   }
 
   @override
   void dispose() {
+    print('正在清理资源...');
     _timer?.cancel();
+    _timer = null;
     _hourlyRateUpdateTimer?.cancel(); // 确保释放高频率定时器
+    _hourlyRateUpdateTimer = null;
     // 移除不必要的收入卡片定时器清理
     _settingsService.settingsChangedNotifier.removeListener(_handleSettingsChanged);
     _currentRate.dispose(); // 释放通知器资源
@@ -169,11 +177,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final isHoliday = _holidayService.isHoliday(now);
     final isSpecialWorkDay = _holidayService.isWorkday(now); // 调休上班日
     
-    // 检查当前是否在工作时间内
-    final bool isWorkTime = _isWithinWorkTime(currentTimeOfDay);
+    // 检查当前是否在工作时间内，使用精确的方法
+    final bool isWorkTime = _isExactlyWithinWorkTime(now);
     
-    // 检查是否到达下班时间
-    final bool isEndOfWorkday = _isAtOrPastEndTime(currentTimeOfDay);
+    // 检查是否到达下班时间，使用精确的方法
+    final bool isEndOfWorkday = _isExactlyAtOrPastEndTime(now);
     
     // 否则，周一至周五是工作日，周六日不是工作日
     final bool isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
@@ -190,29 +198,36 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     
     // 记录当前状态用于后续判断是否发生了状态变化
     final previousStatus = _currentStatus;
+    WorkStatus newStatus = _currentStatus; // 先假设状态不变
     
-    // 更新工作状态
-    setState(() {
-      if (isWorkDay && isWorkTime) {
-        // 在工作日的工作时间内
-        if (_isManualResting) {
-          _currentStatus = WorkStatus.resting;
-        } else {
-          _currentStatus = WorkStatus.working;
-        }
+    // 根据当前情况计算新状态
+    if (isWorkDay && isWorkTime) {
+      // 在工作日的工作时间内
+      if (_isManualResting) {
+        newStatus = WorkStatus.resting;
       } else {
-        // 非工作时间或非工作日
-        if (_isManualOvertime) {
-          _currentStatus = WorkStatus.overtime;
-        } else {
-          // 如果是下班时间且用户处于摸鱼状态，强制切换为下班状态
-          if (_currentStatus == WorkStatus.resting && isEndOfWorkday) {
-            _isManualResting = false; // 重置手动摸鱼状态
-          }
-          _currentStatus = WorkStatus.offWork;
-        }
+        newStatus = WorkStatus.working;
       }
-    });
+    } else {
+      // 非工作时间或非工作日
+      if (_isManualOvertime) {
+        newStatus = WorkStatus.overtime;
+      } else {
+        // 如果是下班时间且用户处于摸鱼状态，强制切换为下班状态
+        if (_currentStatus == WorkStatus.resting && isEndOfWorkday) {
+          _isManualResting = false; // 重置手动摸鱼状态
+        }
+        newStatus = WorkStatus.offWork;
+      }
+    }
+    
+    // 只有当状态发生变化时才调用setState
+    if (newStatus != _currentStatus) {
+      print('自动状态切换: ${_currentStatus.toString()} -> ${newStatus.toString()}');
+      setState(() {
+        _currentStatus = newStatus;
+      });
+    }
     
     // 如果状态从摸鱼中变为下班中，则保存摸鱼数据并清理状态
     if (previousStatus == WorkStatus.resting && _currentStatus == WorkStatus.offWork) {
@@ -231,32 +246,26 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         _restStartTime = null;
         _isManualResting = false;
         _saveRestDuration();
+        print('摸鱼状态自动结束，已保存摸鱼时长');
       }
     }
     
     // 如果状态从加班中变为下班中，则保存加班数据并清理状态
     if (previousStatus == WorkStatus.overtime && _currentStatus == WorkStatus.offWork) {
-      // 保存当前加班时长
-      final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
       if (_overtimeStartTime != null) {
-        // 计算最终加班时长
+        // 计算最终加班时长（包含当前会话）
         final currentSessionDuration = now.difference(_overtimeStartTime!);
         _lastOvertimeDuration = _lastOvertimeDuration + currentSessionDuration;
         _overtimeDuration = _lastOvertimeDuration;
-        
-        // 保存加班时长到每日统计
-        final previousOvertimeMinutes = _settingsService.getOvertimeMinutes(dateStr);
-        final newOvertimeMinutes = previousOvertimeMinutes + currentSessionDuration.inMinutes;
-        _settingsService.setOvertimeMinutes(dateStr, newOvertimeMinutes);
-        
-        // 清除加班状态
         _overtimeStartTime = null;
-        _isManualOvertime = false;
-        _saveOvertimeDuration();
         
         // 停止高频率更新当前时薪
         _stopHighFrequencyHourlyRateUpdate();
+        
+        // 保存当前加班时长
+        _saveOvertimeDuration();
       }
+      print('状态切换: 加班中 -> 下班中');
     }
     
     // 获取当前日期字符串
@@ -295,6 +304,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final currentMinutes = current.hour * 60 + current.minute;
     final endMinutes = _endTime.hour * 60 + _endTime.minute;
     
+    // 只要当前分钟等于或大于结束分钟就返回true
+    // 这样可以确保在到达设定的下班时间点时立即切换状态，不会有延迟
     return currentMinutes >= endMinutes;
   }
 
@@ -354,6 +365,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final now = _timeService.now();
     final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     
+    // 记录切换前的状态，用于调试
+    final prevStatus = _currentStatus;
+    
     setState(() {
       switch (_currentStatus) {
         case WorkStatus.working:
@@ -365,7 +379,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
           // 记录摸鱼开始时间为当前时间
           _restStartTime = now;
           // 立即保存状态，避免意外退出导致状态丢失
-          _saveRestDuration();
+          print('状态切换: 搬砖中 -> 摸鱼中');
           break;
         case WorkStatus.resting:
           // 摸鱼中 -> 搬砖中
@@ -381,9 +395,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
             _settingsService.setDailyRestMinutes(dateStr, restMinutes);
             
             _restStartTime = null;
-            // 保存摸鱼时长
-            _saveRestDuration();
           }
+          print('状态切换: 摸鱼中 -> 搬砖中');
           break;
         case WorkStatus.offWork:
           // 下班中 -> 加班中
@@ -393,10 +406,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
           _overtimeDuration = _lastOvertimeDuration;
           // 记录加班开始时间为当前时间
           _overtimeStartTime = now;
-          // 立即保存加班时长，避免意外退出导致状态丢失
-          _saveOvertimeDuration();
           // 启动高频率更新当前时薪
-          _startHighFrequencyHourlyRateUpdate();
+          print('状态切换: 下班中 -> 加班中');
           break;
         case WorkStatus.overtime:
           // 加班中 -> 下班中
@@ -404,24 +415,38 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
           _currentStatus = WorkStatus.offWork;
           // 保存加班时长但不重置，以便下次继续累计
           if (_overtimeStartTime != null) {
-            // 保存当前完整的加班时长（包含秒）用于下次恢复
-            _lastOvertimeDuration = _overtimeDuration;
+            // 计算最终加班时长（包含当前会话）
+            final currentSessionDuration = now.difference(_overtimeStartTime!);
+            _lastOvertimeDuration = _lastOvertimeDuration + currentSessionDuration;
+            _overtimeDuration = _lastOvertimeDuration;
             
-            // 仍然以分钟精度保存到SharedPreferences
-            final overtimeMinutes = now.difference(_overtimeStartTime!).inMinutes;
-            final previousOvertimeMinutes = _settingsService.getOvertimeMinutes(dateStr);
-            final totalOvertimeMinutes = previousOvertimeMinutes + overtimeMinutes;
-            _settingsService.setOvertimeMinutes(dateStr, totalOvertimeMinutes);
-            
+            // 停止加班计时
             _overtimeStartTime = null;
-            // 保存加班时长
-            _saveOvertimeDuration();
+            
             // 停止高频率更新当前时薪
             _stopHighFrequencyHourlyRateUpdate();
           }
+          print('状态切换: 加班中 -> 下班中');
           break;
       }
     });
+
+    // 状态切换后立即执行一次状态相关的保存操作
+    if (prevStatus == WorkStatus.working && _currentStatus == WorkStatus.resting) {
+      _saveRestDuration();
+    } else if (prevStatus == WorkStatus.resting && _currentStatus == WorkStatus.working) {
+      _saveRestDuration();
+    } else if (prevStatus == WorkStatus.offWork && _currentStatus == WorkStatus.overtime) {
+      _saveOvertimeDuration();
+      _startHighFrequencyHourlyRateUpdate();
+    } else if (prevStatus == WorkStatus.overtime && _currentStatus == WorkStatus.offWork) {
+      _saveOvertimeDuration();
+    }
+
+    // 强制更新UI状态
+    print('状态切换完成，当前状态: ${_currentStatus.toString()}');
+    // 主动调用一次状态更新
+    _updateStatus();
   }
 
   void _handleRestDurationUpdate(Duration duration) {
@@ -445,22 +470,40 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
       // 计算当前加班会话的时长
       final currentSessionDuration = now.difference(_overtimeStartTime!);
       
-      // 我们在开始加班时已经将_overtimeDuration设置为累计值（包含秒精度）
-      // 因此这里只需要处理当前会话的增量即可
+      // 总加班时长 = 上次保存的时长 + 当前会话时长
       final newOvertimeDuration = _lastOvertimeDuration + currentSessionDuration;
       
       // 只有当加班时长有变化时才更新UI
       if (newOvertimeDuration.inSeconds != _overtimeDuration.inSeconds) {
-        setState(() {
-          _overtimeDuration = newOvertimeDuration;
-        });
+        // 移除setState调用，直接更新时长并调用handler
+        _overtimeDuration = newOvertimeDuration;
         
-        // 仅在分钟数变化时更新存储（仍然只存储分钟精度到SharedPreferences）
-        final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-        if (newOvertimeDuration.inMinutes != _settingsService.getOvertimeMinutes(dateStr)) {
-          _settingsService.setOvertimeMinutes(dateStr, newOvertimeDuration.inMinutes);
-        }
+        // 通知更新，类似_handleRestDurationUpdate
+        _handleOvertimeDurationUpdate(_overtimeDuration);
       }
+    }
+  }
+
+  // 添加新方法：处理加班时长更新，类似于摸鱼时长更新处理
+  void _handleOvertimeDurationUpdate(Duration duration) {
+    // 更新_overtimeDuration变量
+    _overtimeDuration = duration;
+    
+    // 仅在分钟数变化时更新存储
+    final now = _timeService.now();
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final storedMinutes = _settingsService.getOvertimeMinutes(dateStr);
+    
+    if (duration.inMinutes != storedMinutes) {
+      _settingsService.setOvertimeMinutes(dateStr, duration.inMinutes);
+    }
+    
+    // 如果在加班状态下，更新状态卡片中的计时器显示
+    if (_currentStatus == WorkStatus.overtime) {
+      setState(() {
+        // 这里不需要更新_overtimeDuration，因为上面已经更新了
+        // 这个setState只是为了触发UI刷新计时器显示
+      });
     }
   }
 
@@ -720,6 +763,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   }
 
   Widget _buildStatusContent() {
+    print('构建状态内容，当前状态: ${_currentStatus.toString()}');
     switch (_currentStatus) {
       case WorkStatus.working:
         return SizedBox(
@@ -800,20 +844,44 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         // 获取加班文案
         final messageText = getRandomOvertimeMessage(_overtimeDuration);
         
+        // 计算加班收入 - 使用时薪和当前加班时长
+        final overtimeHours = _overtimeDuration.inMilliseconds / (1000 * 60 * 60);
+        final hourlyRate = _salaryType == '时薪'
+          ? _salary
+          : _settingsService.getHourlySalary();
+        final overtimeEarnings = overtimeHours * hourlyRate;
+        
+        // 格式化加班收入
+        final formattedEarnings = _isDataHidden 
+          ? '¥*****.**' 
+          : _formatAmount(overtimeEarnings);
+        
         return SizedBox(
           height: 240,
           child: Center(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
+                // 加班时长 - 放在上方，样式不显眼
+                Text(
+                  '${_overtimeDuration.inHours.toString().padLeft(2, '0')}:${(_overtimeDuration.inMinutes % 60).toString().padLeft(2, '0')}:${(_overtimeDuration.inSeconds % 60).toString().padLeft(2, '0')}',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.grey[500],
+                    fontWeight: FontWeight.normal,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                // 加班图标
                 const Icon(
                   Icons.psychology_alt, 
                   size: 48, 
                   color: AppTheme.primaryColor
                 ),
                 const SizedBox(height: 24),
+                // 加班收入 - 中间最显眼位置
                 Text(
-                  '${_overtimeDuration.inHours.toString().padLeft(2, '0')}:${(_overtimeDuration.inMinutes % 60).toString().padLeft(2, '0')}:${(_overtimeDuration.inSeconds % 60).toString().padLeft(2, '0')}',
+                  formattedEarnings,
                   style: const TextStyle(
                     fontSize: 32,
                     fontWeight: FontWeight.bold,
@@ -975,6 +1043,13 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         
     // 修改：时薪卡片在加班中状态下不置灰
     bool shouldGrayOutHourlyRate = _currentStatus == WorkStatus.offWork;
+    
+    // 新增：今日加班卡片在下班状态下置灰，加班状态下不置灰
+    bool shouldGrayOutOvertimeEarnings = _currentStatus == WorkStatus.offWork;
+    
+    // 新增：所有卡片在摸鱼状态和工作状态下都不置灰
+    bool shouldGrayOutAllCards = _currentStatus == WorkStatus.offWork || 
+        (_currentStatus == WorkStatus.overtime);
 
     return Column(
       children: [
@@ -1067,11 +1142,25 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
                         : _settingsService.getHourlySalary();
                       return overtimeHours * hourlyRate;
                     },
-                    shouldGrayOut: false,
+                    shouldGrayOut: false, // 加班状态下不置灰加班卡片
                     timeService: _timeService,
                     isDataHidden: _isDataHidden,
                   )
-                : _buildEarningsCard('今日加班', 0.0, shouldGrayOut: _currentStatus != WorkStatus.overtime),
+                : RealtimeEarningsCard(
+                    title: '今日加班',
+                    amountCalculator: () {
+                      // 统一使用_overtimeDuration，不再使用_lastOvertimeDuration
+                      // 这与摸鱼卡片的实现保持一致
+                      final overtimeHours = _overtimeDuration.inMilliseconds / (1000 * 60 * 60);
+                      final hourlyRate = _salaryType == '时薪'
+                        ? _salary
+                        : _settingsService.getHourlySalary();
+                      return overtimeHours * hourlyRate;
+                    },
+                    shouldGrayOut: shouldGrayOutOvertimeEarnings, // 使用变量控制置灰
+                    timeService: _timeService,
+                    isDataHidden: _isDataHidden,
+                  ),
             ),
           ],
         ),
@@ -1092,6 +1181,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
               child: HolidayCountdownCard(
                 timeService: _timeService,
                 holidayService: _holidayService,
+                shouldGrayOut: shouldGrayOutAllCards, // 在加班和下班状态下置灰
               ),
             ),
           ],
@@ -1163,6 +1253,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   }
 
   String _getButtonText() {
+    print('获取按钮文本，当前状态: ${_currentStatus.toString()}');
     switch (_currentStatus) {
       case WorkStatus.working:
         return '开始摸鱼';
@@ -1469,11 +1560,13 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final now = _timeService.now();
     final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     
-    // 只保存当前加班累计时长（毫秒级精度）
+    // 保存当前加班累计时长（毫秒级精度）
     await prefs.setInt(_lastOvertimeDurationKey, _overtimeDuration.inMilliseconds);
     
     // 同时以分钟精度更新每日加班时长（用于历史统计）
     await _settingsService.setOvertimeMinutes(dateStr, _overtimeDuration.inMinutes);
+    
+    print('已保存加班时长(毫秒): ${_overtimeDuration.inMilliseconds}, 分钟: ${_overtimeDuration.inMinutes}');
   }
 
   // 恢复上次的时长数据
@@ -1567,6 +1660,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
       return '¥*****.**';
     }
     
+    // 处理负数情况
+    if (amount < 0) return '¥0.00';
+    
     final formattedAmount = amount.toStringAsFixed(2);
     final parts = formattedAmount.split('.');
     final wholePart = parts[0].replaceAllMapped(
@@ -1653,6 +1749,57 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
       
       print('已重置加班时长 - 新的一天开始');
     }
+  }
+
+  // 更精确地判断是否到达或超过下班时间，精确到秒
+  bool _isExactlyAtOrPastEndTime(DateTime now) {
+    // 创建表示今天下班时间的完整DateTime对象
+    final workEndDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
+    
+    // 如果当前时间恰好等于下班时间，打印日志
+    if (now.hour == _endTime.hour && now.minute == _endTime.minute && now.second < 10) {
+      print('下班时间点精确匹配: 当前时间=${now.hour}:${now.minute}:${now.second}, 下班时间=${_endTime.hour}:${_endTime.minute}:00');
+    }
+    
+    // 精确到秒比较，只要到达或超过下班时间，就返回true
+    bool result = now.isAtSameMomentAs(workEndDateTime) || now.isAfter(workEndDateTime);
+    
+    // 如果状态刚刚切换，记录日志
+    if (result && now.hour == _endTime.hour && now.minute == _endTime.minute && now.second < 10) {
+      print('状态将切换为下班: 当前=${now.toString()}, 下班时间=${workEndDateTime.toString()}');
+    }
+    
+    return result;
+  }
+
+  // 精确到秒判断是否在工作时间内
+  bool _isExactlyWithinWorkTime(DateTime now) {
+    // 创建表示今天上班和下班时间的完整DateTime对象
+    final workStartDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _startTime.hour,
+      _startTime.minute,
+    );
+    
+    final workEndDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
+    
+    // 精确到秒比较，检查当前时间是否在工作时间内
+    return (now.isAfter(workStartDateTime) || now.isAtSameMomentAs(workStartDateTime)) && 
+           now.isBefore(workEndDateTime);
   }
 }
 
@@ -1805,11 +1952,13 @@ class _RealtimeEarningsCardState extends State<RealtimeEarningsCard> {
 class HolidayCountdownCard extends StatefulWidget {
   final TimeService timeService;
   final HolidayService holidayService;
+  final bool shouldGrayOut;
 
   const HolidayCountdownCard({
     Key? key,
     required this.timeService,
     required this.holidayService,
+    this.shouldGrayOut = false,
   }) : super(key: key);
 
   @override
@@ -1879,10 +2028,11 @@ class _HolidayCountdownCardState extends State<HolidayCountdownCard> {
     final formattedDate = _holidayInfo['formattedDate'] as String;
     final weekday = _holidayInfo['weekday'] as String;
     
-    // 颜色设置 - 使用应用主题色
-    final backgroundColor = Colors.white;
-    final titleColor = Colors.grey;
-    final daysColor = AppTheme.primaryColor;
+    // 颜色设置 - 根据是否置灰调整颜色
+    final backgroundColor = widget.shouldGrayOut ? Colors.grey[100]! : Colors.white;
+    final titleColor = widget.shouldGrayOut ? Colors.grey[500]! : Colors.grey;
+    final daysColor = widget.shouldGrayOut ? Colors.grey[600]! : AppTheme.primaryColor;
+    final dateColor = widget.shouldGrayOut ? Colors.grey[400]! : Colors.grey.shade500;
     
     return GestureDetector(
       onTap: _refreshData, // 添加点击刷新功能
@@ -1940,7 +2090,7 @@ class _HolidayCountdownCardState extends State<HolidayCountdownCard> {
                 Text(
                   '$formattedDate · $weekday',
                   style: TextStyle(
-                    color: Colors.grey.shade500,
+                    color: dateColor,
                     fontSize: 12,
                   ),
                   overflow: TextOverflow.ellipsis,
@@ -1965,7 +2115,9 @@ class _HolidayCountdownCardState extends State<HolidayCountdownCard> {
                   : Icon(
                       Icons.refresh,
                       size: 20,
-                      color: AppTheme.primaryColor.withOpacity(0.6),
+                      color: widget.shouldGrayOut 
+                        ? Colors.grey[400]! 
+                        : AppTheme.primaryColor.withOpacity(0.6),
                     ),
               ),
             ),
