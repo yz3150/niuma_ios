@@ -168,7 +168,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   void _updateStatus() {
     // 获取当前日期时间
     final now = _timeService.now();
-    final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
     final todayDateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     final yesterday = now.subtract(const Duration(days: 1));
     final yesterdayStr = '${yesterday.year}-${yesterday.month.toString().padLeft(2, '0')}-${yesterday.day.toString().padLeft(2, '0')}';
@@ -187,9 +186,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final bool isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
     final bool isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
     
-    // 检查是否需要重置所有计时器（上班时间到达时）
-    if (isWorkDay && _isAtStartTime(currentTimeOfDay)) {
-      print('检测到上班时间窗口：${currentTimeOfDay.hour}:${currentTimeOfDay.minute}，准备重置计时器');
+    // 检查是否需要重置所有计时器（上班时间到达时），使用精确到秒的判断
+    if (isWorkDay && _isAtStartTime(now)) {
+      print('检测到准确上班时间：${now.hour}:${now.minute}:${now.second}，准备重置计时器');
       _checkAndResetAllTimers(todayDateStr);
     }
     
@@ -275,7 +274,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 1. 上班时间刚到（早上），用于保存前一天的数据
     // 2. 当前是工作日
     // 3. 前一天的数据尚未保存
-    if (isWorkDay && _isAtStartTime(currentTimeOfDay) && yesterdayStr != _lastSavedDailyDataDate) {
+    if (isWorkDay && _isAtStartTime(now) && yesterdayStr != _lastSavedDailyDataDate) {
       // 保存昨天的数据
       _saveDailyData(yesterdayStr);
     }
@@ -292,40 +291,61 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     );
   }
 
-  bool _isWithinWorkTime(TimeOfDay current) {
-    final currentMinutes = current.hour * 60 + current.minute;
-    final startMinutes = _startTime.hour * 60 + _startTime.minute;
-    final endMinutes = _endTime.hour * 60 + _endTime.minute;
+  bool _isWithinWorkTime(DateTime now) {
+    // 创建表示今天上班和下班时间的完整DateTime对象
+    final workStartDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _startTime.hour,
+      _startTime.minute,
+    );
     
-    return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+    final workEndDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
+    
+    // 检查当前时间是否在工作时间内
+    return (now.isAfter(workStartDateTime) || now.isAtSameMomentAs(workStartDateTime)) && 
+           now.isBefore(workEndDateTime);
   }
 
-  bool _isAtOrPastEndTime(TimeOfDay current) {
-    final currentMinutes = current.hour * 60 + current.minute;
-    final endMinutes = _endTime.hour * 60 + _endTime.minute;
+  bool _isAtOrPastEndTime(DateTime now) {
+    // 创建表示今天下班时间的完整DateTime对象
+    final workEndDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
     
-    // 只要当前分钟等于或大于结束分钟就返回true
-    // 这样可以确保在到达设定的下班时间点时立即切换状态，不会有延迟
-    return currentMinutes >= endMinutes;
+    // 检查当前时间是否等于或超过下班时间
+    return now.isAtSameMomentAs(workEndDateTime) || now.isAfter(workEndDateTime);
   }
 
-  // 检查是否刚好到达上班时间
-  bool _isAtStartTime(TimeOfDay current) {
-    final currentMinutes = current.hour * 60 + current.minute;
-    final startMinutes = _startTime.hour * 60 + _startTime.minute;
+  // 检查是否刚好到达上班时间，精确到秒级
+  bool _isAtStartTime(DateTime now) {
+    // 创建表示今天上班时间的完整DateTime对象，精确到秒
+    final workStartDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _startTime.hour,
+      _startTime.minute,
+      0, // 秒设为0
+    );
     
-    // 处理凌晨时间的边界情况
-    if (startMinutes < 5) {
-      // 如果上班时间在凌晨前5分钟内(如00:03)，则需要特殊处理
-      // 当前时间可能是前一天的深夜(如23:58)或当天的凌晨(如00:01)
-      if (currentMinutes >= 24*60 - (5 - startMinutes) || currentMinutes <= startMinutes) {
-        return true;
-      }
-      return false;
-    }
+    // 计算当前时间与上班时间的差异（秒）
+    final differenceInSeconds = now.difference(workStartDateTime).inSeconds;
     
-    // 正常情况：检查是否在上班开始时间前的5分钟内
-    return currentMinutes >= startMinutes - 5 && currentMinutes <= startMinutes;
+    // 只有当前时间在上班时间的前5秒内才返回true
+    // 这样可以确保只在上班时间到达的瞬间附近触发重置
+    return differenceInSeconds >= 0 && differenceInSeconds < 5;
   }
   
   // 获取实际下班时间，考虑加班情况
@@ -1576,7 +1596,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 获取当前日期字符串
     final now = _timeService.now();
     final todayDateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-    final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
     
     // 检查今天是否已重置计时器，如果没有且当前是上班时间，则重置
     final isHoliday = _holidayService.isHoliday(now);
@@ -1584,7 +1603,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
     final isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
     
-    if (isWorkDay && _isAtStartTime(currentTimeOfDay)) {
+    if (isWorkDay && _isAtStartTime(now)) {
       final lastResetDate = prefs.getString(_lastTimerResetDateKey);
       if (lastResetDate != todayDateStr) {
         // 重置所有计时器
@@ -1637,7 +1656,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     await prefs.remove(_overtimeStartTimeKey);
     
     // 根据当前时间判断是工作中还是下班中
-    final isWorkTime = _isWithinWorkTime(currentTimeOfDay);
+    final isWorkTime = _isExactlyWithinWorkTime(now);
     
     // 在下一帧设置状态，避免在initState中调用setState
     Future.microtask(() {
@@ -1675,13 +1694,20 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
 
   // 添加检查和重置所有计时器的方法
   Future<void> _checkAndResetAllTimers(String todayDateStr) async {
+    final now = _timeService.now();
+    
+    print('执行重置计时器检查 - 当前时间: ${now.hour}:${now.minute}:${now.second}，上班时间: ${_startTime.hour}:${_startTime.minute}:00');
+    
     final prefs = await SharedPreferences.getInstance();
     final lastResetDate = prefs.getString(_lastTimerResetDateKey);
     
     // 如果今天已经重置过，则不再重置
     if (lastResetDate == todayDateStr) {
+      print('今天(${todayDateStr})已经重置过计时器，跳过重置');
       return;
     }
+    
+    print('开始重置计时器 - 新的一天开始了');
     
     // 重置摸鱼时长
     _lastRestDuration = Duration.zero;
@@ -1701,6 +1727,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 清除开始时间
     _restStartTime = null;
     _overtimeStartTime = null;
+    
+    print('已重置所有计时器数据 - 摸鱼时长和加班时长已清零');
     
     // 更新UI
     setState(() {
