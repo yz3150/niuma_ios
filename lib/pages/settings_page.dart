@@ -141,6 +141,7 @@ class _SettingsPageState extends State<SettingsPage> {
           value: _salaryType,
           items: const [
             DropdownMenuItem(value: '月薪', child: Text('月薪')),
+            DropdownMenuItem(value: '年薪', child: Text('年薪')),
             DropdownMenuItem(value: '日薪', child: Text('日薪')),
             DropdownMenuItem(value: '时薪', child: Text('时薪')),
           ],

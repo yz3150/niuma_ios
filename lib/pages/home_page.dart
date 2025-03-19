@@ -158,31 +158,30 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   }
 
   void _updateStatus() {
+    // 获取当前日期时间
     final now = _timeService.now();
     final currentTimeOfDay = TimeOfDay(hour: now.hour, minute: now.minute);
     final todayDateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final yesterday = now.subtract(const Duration(days: 1));
+    final yesterdayStr = '${yesterday.year}-${yesterday.month.toString().padLeft(2, '0')}-${yesterday.day.toString().padLeft(2, '0')}';
     
-    // 1. 检查是否是国家法定节假日
+    // 检查是否为周末或节假日
     final isHoliday = _holidayService.isHoliday(now);
     final isSpecialWorkDay = _holidayService.isWorkday(now); // 调休上班日
     
-    // 2. 移除检查用户设置的工作日逻辑
-    
-    // 3. 检查是否在工作时间内
+    // 检查当前是否在工作时间内
     final bool isWorkTime = _isWithinWorkTime(currentTimeOfDay);
     
-    // 4. 检查是否到达或超过下班时间
+    // 检查是否到达下班时间
     final bool isEndOfWorkday = _isAtOrPastEndTime(currentTimeOfDay);
     
-    // 综合判断是否是工作日
-    // 如果是法定节假日，则不是工作日
-    // 如果是特殊调休上班日，则是工作日
     // 否则，周一至周五是工作日，周六日不是工作日
     final bool isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
     final bool isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
     
     // 检查是否需要重置所有计时器（上班时间到达时）
     if (isWorkDay && _isAtStartTime(currentTimeOfDay)) {
+      print('检测到上班时间窗口：${currentTimeOfDay.hour}:${currentTimeOfDay.minute}，准备重置计时器');
       _checkAndResetAllTimers(todayDateStr);
     }
     
@@ -263,10 +262,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 获取当前日期字符串
     final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     
-    // 获取昨天的日期字符串
-    final yesterday = now.subtract(const Duration(days: 1));
-    final yesterdayStr = '${yesterday.year}-${yesterday.month.toString().padLeft(2, '0')}-${yesterday.day.toString().padLeft(2, '0')}';
-    
     // 新的保存数据触发条件：
     // 1. 上班时间刚到（早上），用于保存前一天的数据
     // 2. 当前是工作日
@@ -308,8 +303,18 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final currentMinutes = current.hour * 60 + current.minute;
     final startMinutes = _startTime.hour * 60 + _startTime.minute;
     
-    // 允许有5分钟的误差范围，确保不会错过触发
-    return currentMinutes >= startMinutes && currentMinutes <= startMinutes + 5;
+    // 处理凌晨时间的边界情况
+    if (startMinutes < 5) {
+      // 如果上班时间在凌晨前5分钟内(如00:03)，则需要特殊处理
+      // 当前时间可能是前一天的深夜(如23:58)或当天的凌晨(如00:01)
+      if (currentMinutes >= 24*60 - (5 - startMinutes) || currentMinutes <= startMinutes) {
+        return true;
+      }
+      return false;
+    }
+    
+    // 正常情况：检查是否在上班开始时间前的5分钟内
+    return currentMinutes >= startMinutes - 5 && currentMinutes <= startMinutes;
   }
   
   // 获取实际下班时间，考虑加班情况
@@ -1581,6 +1586,16 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         _stopHighFrequencyHourlyRateUpdate();
       }
     });
+    
+    // 显示重置通知
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('新的工作日开始了，计时器已重置！'),
+          duration: Duration(seconds: 3),
+        ),
+      );
+    }
     
     print('上班时间到达：已重置所有计时器');
   }

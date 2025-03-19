@@ -69,6 +69,7 @@ class SalaryCalculator {
 
     switch (salaryType) {
       case '月薪':
+      case '年薪':
       case '日薪':
         // 使用预计算的日薪 * 当天工作比例（使用毫秒级精度）
         return (workedMilliseconds / totalWorkMilliseconds) * dailySalary;
@@ -94,6 +95,7 @@ class SalaryCalculator {
 
     switch (salaryType) {
       case '月薪':
+      case '年薪':
       case '日薪':
         // 使用预计算的时薪 * 摸鱼小时数
         return restHours * hourlySalary;

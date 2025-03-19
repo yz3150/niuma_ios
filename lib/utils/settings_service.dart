@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'holiday_service.dart';
 
 class SettingsService {
   static final SettingsService _instance = SettingsService._internal();
@@ -32,18 +33,72 @@ class SettingsService {
     return _prefsInstance!;
   }
 
+  // 获取当年工作日天数（当年的工作日数量）
+  int getYearWorkdays() {
+    final now = DateTime.now();
+    final year = now.year;
+    
+    // 使用一次遍历计算工作日数量
+    final holidayService = HolidayService();
+    int workDays = 0;
+    
+    // 从1月1日遍历到12月31日
+    DateTime date = DateTime(year, 1, 1);
+    final lastDayOfYear = DateTime(year + 1, 1, 1).subtract(const Duration(days: 1));
+    
+    while (!date.isAfter(lastDayOfYear)) {
+      // 使用HolidayService的shouldWork方法直接判断是否是工作日
+      // shouldWork已经处理了法定节假日、调休和周末的逻辑
+      if (holidayService.shouldWork(date)) {
+        workDays++;
+      }
+      
+      // 移至下一天
+      date = date.add(const Duration(days: 1));
+    }
+    
+    return workDays;
+  }
+
+  // 计算实际工作小时数（根据用户设置的上下班时间）
+  double getActualWorkHoursPerDay() {
+    final startTime = getStartTime();
+    final endTime = getEndTime();
+    
+    // 计算从上班到下班的小时数
+    final startMinutes = startTime.hour * 60 + startTime.minute;
+    final endMinutes = endTime.hour * 60 + endTime.minute;
+    
+    // 如果结束时间早于开始时间，假定跨天（例如夜班）
+    final totalMinutes = endMinutes >= startMinutes 
+        ? endMinutes - startMinutes 
+        : (24 * 60 - startMinutes) + endMinutes;
+    
+    return totalMinutes / 60.0;
+  }
+
   // 计算并保存日薪和时薪
   Future<void> _updateDerivedSalaries() async {
     final prefs = await _prefs;
     final salaryType = getSalaryType();
     final salary = getSalary();
+    
+    // 获取实际工作小时数
+    final actualWorkHoursPerDay = getActualWorkHoursPerDay();
+    
+    // 计算实际每月工作小时数
+    final actualWorkHoursPerMonth = actualWorkHoursPerDay * standardWorkDaysPerMonth;
 
     // 计算日薪
     double dailySalary;
     if (salaryType == '月薪') {
       dailySalary = salary / standardWorkDaysPerMonth;
     } else if (salaryType == '时薪') {
-      dailySalary = salary * standardWorkHoursPerDay;
+      dailySalary = salary * actualWorkHoursPerDay;
+    } else if (salaryType == '年薪') {
+      // 使用年工作日数计算日薪
+      final workdays = getYearWorkdays();
+      dailySalary = salary / workdays;
     } else {
       dailySalary = salary;
     }
@@ -51,9 +106,13 @@ class SettingsService {
     // 计算时薪
     double hourlySalary;
     if (salaryType == '月薪') {
-      hourlySalary = salary / standardWorkHoursPerMonth;
+      hourlySalary = salary / actualWorkHoursPerMonth;
     } else if (salaryType == '日薪') {
-      hourlySalary = salary / standardWorkHoursPerDay;
+      hourlySalary = salary / actualWorkHoursPerDay;
+    } else if (salaryType == '年薪') {
+      // 年薪的时薪 = 日薪 / 每日实际工作小时数
+      final workdays = getYearWorkdays();
+      hourlySalary = (salary / workdays) / actualWorkHoursPerDay;
     } else {
       hourlySalary = salary;
     }
