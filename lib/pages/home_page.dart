@@ -978,6 +978,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
 
     return Column(
       children: [
+        // 第一行：今日搬砖 今日摸鱼
         Row(
           children: [
             Expanded(
@@ -1012,15 +1013,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
           ],
         ),
         const SizedBox(height: 16),
+        
+        // 第二行：今日时薪 今日加班
         Row(
           children: [
             Expanded(
-              flex: 1,
-              child: _buildEarningsCard('今年搬砖(不含今日)', yearToDateEarnings),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              flex: 1,
               child: _currentStatus == WorkStatus.overtime 
                 // 加班状态下，使用实时计算的时薪
                 ? RealtimeEarningsCard(
@@ -1057,10 +1054,45 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
                 // 非加班状态，使用普通卡片
                 : _buildEarningsCard('今日时薪', hourlyRate, shouldGrayOut: shouldGrayOutHourlyRate),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 16),
             Expanded(
-              flex: 1,
+              child: _currentStatus == WorkStatus.overtime
+                ? RealtimeEarningsCard(
+                    title: '今日加班',
+                    amountCalculator: () {
+                      // 使用时薪和当前加班时长计算加班收入
+                      final overtimeHours = _overtimeDuration.inMilliseconds / (1000 * 60 * 60);
+                      final hourlyRate = _salaryType == '时薪'
+                        ? _salary
+                        : _settingsService.getHourlySalary();
+                      return overtimeHours * hourlyRate;
+                    },
+                    shouldGrayOut: false,
+                    timeService: _timeService,
+                    isDataHidden: _isDataHidden,
+                  )
+                : _buildEarningsCard('今日加班', 0.0, shouldGrayOut: _currentStatus != WorkStatus.overtime),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        
+        // 第三行：今年搬砖 本周摸鱼 放假倒计时
+        Row(
+          children: [
+            Expanded(
+              child: _buildEarningsCard('今年搬砖(不含今日)', yearToDateEarnings),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
               child: _buildEarningsCard('本周摸鱼(不含今日)', weekRestEarnings),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: HolidayCountdownCard(
+                timeService: _timeService,
+                holidayService: _holidayService,
+              ),
             ),
           ],
         ),
@@ -1624,21 +1656,23 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
   }
 }
 
-// 添加一个新的实时更新收入卡片组件
+// 重新创建实时收入显示卡片
 class RealtimeEarningsCard extends StatefulWidget {
   final String title;
-  final Function() amountCalculator;
+  final double Function() amountCalculator;
   final bool shouldGrayOut;
   final TimeService timeService;
   final bool isDataHidden;
+  final Duration refreshInterval;
 
   const RealtimeEarningsCard({
     Key? key,
     required this.title,
     required this.amountCalculator,
-    required this.shouldGrayOut,
+    this.shouldGrayOut = false,
     required this.timeService,
     required this.isDataHidden,
+    this.refreshInterval = const Duration(seconds: 1),
   }) : super(key: key);
 
   @override
@@ -1647,18 +1681,21 @@ class RealtimeEarningsCard extends StatefulWidget {
 
 class _RealtimeEarningsCardState extends State<RealtimeEarningsCard> {
   late Timer _updateTimer;
-  late ValueNotifier<double> _amountNotifier;
+  double _amount = 0.0;
+  bool _hasError = false;
+  String _errorMessage = '';
 
   @override
   void initState() {
     super.initState();
-    _amountNotifier = ValueNotifier<double>(widget.amountCalculator());
     
-    // 更高频率更新金额 - 每16毫秒更新一次 (约60FPS)
-    _updateTimer = Timer.periodic(const Duration(milliseconds: 16), (timer) {
-      final newAmount = widget.amountCalculator();
-      if (newAmount != _amountNotifier.value) {
-        _amountNotifier.value = newAmount;
+    // 初始化计算金额
+    _calculateAmount();
+    
+    // 设置定时更新
+    _updateTimer = Timer.periodic(widget.refreshInterval, (timer) {
+      if (mounted) {
+        _calculateAmount();
       }
     });
   }
@@ -1669,68 +1706,272 @@ class _RealtimeEarningsCardState extends State<RealtimeEarningsCard> {
     super.dispose();
   }
 
+  // 安全地计算金额
+  void _calculateAmount() {
+    try {
+      setState(() {
+        _amount = widget.amountCalculator();
+        _hasError = false;
+        _errorMessage = '';
+      });
+    } catch (e) {
+      setState(() {
+        _hasError = true;
+        _errorMessage = '计算错误: ${e.toString()}';
+        // 保持上一次的有效金额
+      });
+      print('RealtimeEarningsCard 计算错误: $e');
+    }
+  }
+
+  // 格式化金额显示
+  String _formatAmount(double amount) {
+    // 处理负数情况
+    if (amount < 0) return '¥0.00';
+    
+    // 将金额转换为两位小数的字符串
+    final wholePart = amount.floor().toString();
+    final decimalPart = ((amount - amount.floor()) * 100).round().toString().padLeft(2, '0');
+    
+    return '¥$wholePart.$decimalPart';
+  }
+
   @override
   Widget build(BuildContext context) {
+    // 下班状态和加班状态时的置灰效果
     final Color backgroundColor = widget.shouldGrayOut ? Colors.grey[100]! : Colors.white;
     final Color textColor = widget.shouldGrayOut ? Colors.grey[500]! : Colors.grey;
-    final Color amountColor = widget.shouldGrayOut ? Colors.grey[600]! : Colors.black87;
+    final Color amountColor = widget.shouldGrayOut ? Colors.grey[600]! : 
+                             _hasError ? Colors.red : Colors.black87;
     
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: backgroundColor,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 1,
-            blurRadius: 5,
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            widget.title,
-            style: TextStyle(
-              color: textColor,
-              fontSize: 14,
+    // 获取金额文本，根据隐藏状态决定是否显示星号
+    final String amountText = widget.isDataHidden ? '¥*****.**' : 
+                             _hasError ? '计算中...' : _formatAmount(_amount);
+    
+    return GestureDetector(
+      onTap: _calculateAmount, // 添加点击刷新功能
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.grey.withOpacity(0.1),
+              spreadRadius: 1,
+              blurRadius: 5,
             ),
-          ),
-          const SizedBox(height: 8),
-          ValueListenableBuilder<double>(
-            valueListenable: _amountNotifier,
-            builder: (context, amount, child) {
-              return Text(
-                _formatAmount(amount),
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: amountColor,
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              widget.title,
+              style: TextStyle(
+                color: textColor,
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              amountText,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                color: amountColor,
+              ),
+            ),
+            // 在有错误时显示错误提示
+            if (_hasError && !widget.isDataHidden)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '点击刷新',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.red[300],
+                  ),
                 ),
-              );
-            },
-          ),
-        ],
+              ),
+          ],
+        ),
       ),
     );
   }
+}
 
-  // 格式化金额的辅助方法
-  String _formatAmount(double amount) {
-    // 如果数据隐藏状态为true，则返回隐藏的金额显示
-    if (widget.isDataHidden) {
-      return '¥*****.**';
-    }
+// 添加放假倒计时卡片组件
+class HolidayCountdownCard extends StatefulWidget {
+  final TimeService timeService;
+  final HolidayService holidayService;
+
+  const HolidayCountdownCard({
+    Key? key,
+    required this.timeService,
+    required this.holidayService,
+  }) : super(key: key);
+
+  @override
+  State<HolidayCountdownCard> createState() => _HolidayCountdownCardState();
+}
+
+class _HolidayCountdownCardState extends State<HolidayCountdownCard> {
+  late Map<String, dynamic> _holidayInfo;
+  late Timer _updateTimer;
+  bool _isRefreshing = false;
+
+  @override
+  void initState() {
+    super.initState();
     
-    final formattedAmount = amount.toStringAsFixed(2);
-    final parts = formattedAmount.split('.');
-    final wholePart = parts[0].replaceAllMapped(
-      RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
-      (match) => '${match[1]},',
+    // 初始化节假日信息
+    _holidayInfo = widget.holidayService.getNextHoliday(widget.timeService.now());
+    
+    // 设置每天午夜更新一次
+    _setupMidnightUpdate();
+  }
+
+  @override
+  void dispose() {
+    _updateTimer.cancel();
+    super.dispose();
+  }
+
+  // 设置午夜更新定时器
+  void _setupMidnightUpdate() {
+    // 计算到明天午夜的时间
+    final now = widget.timeService.now();
+    final tomorrow = DateTime(now.year, now.month, now.day + 1);
+    final duration = tomorrow.difference(now);
+    
+    // 设置定时器，到午夜时更新信息
+    _updateTimer = Timer(duration, () {
+      if (mounted) {
+        setState(() {
+          _holidayInfo = widget.holidayService.getNextHoliday(widget.timeService.now());
+        });
+        // 设置下一个午夜更新
+        _setupMidnightUpdate();
+      }
+    });
+  }
+
+  // 手动刷新节假日数据
+  Future<void> _refreshData() async {
+    setState(() {
+      _isRefreshing = true;
+    });
+
+    // 模拟网络延迟
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    setState(() {
+      _holidayInfo = widget.holidayService.getNextHoliday(widget.timeService.now());
+      _isRefreshing = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final holidayName = _holidayInfo['name'] as String;
+    final daysRemaining = _holidayInfo['daysRemaining'] as int;
+    final formattedDate = _holidayInfo['formattedDate'] as String;
+    final weekday = _holidayInfo['weekday'] as String;
+    
+    // 颜色设置 - 使用应用主题色
+    final backgroundColor = Colors.white;
+    final titleColor = Colors.grey;
+    final daysColor = AppTheme.primaryColor;
+    
+    return GestureDetector(
+      onTap: _refreshData, // 添加点击刷新功能
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.grey.withOpacity(0.1),
+              spreadRadius: 1,
+              blurRadius: 5,
+            ),
+          ],
+        ),
+        child: Stack(
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '距离$holidayName还有',
+                  style: TextStyle(
+                    color: titleColor,
+                    fontSize: 14,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.baseline,
+                  textBaseline: TextBaseline.alphabetic,
+                  children: [
+                    Text(
+                      '$daysRemaining',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                        color: daysColor,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '天',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: daysColor,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                // 添加节假日具体日期和星期
+                Text(
+                  '$formattedDate · $weekday',
+                  style: TextStyle(
+                    color: Colors.grey.shade500,
+                    fontSize: 12,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+            // 刷新按钮
+            Positioned(
+              top: 0,
+              right: 0,
+              child: GestureDetector(
+                onTap: _isRefreshing ? null : _refreshData,
+                child: _isRefreshing
+                  ? SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(AppTheme.primaryColor),
+                      ),
+                    )
+                  : Icon(
+                      Icons.refresh,
+                      size: 20,
+                      color: AppTheme.primaryColor.withOpacity(0.6),
+                    ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
-    final decimalPart = parts[1];
-    return '¥$wholePart.$decimalPart';
   }
 } 
