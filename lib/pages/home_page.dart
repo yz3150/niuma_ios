@@ -188,7 +188,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     
     // 检查是否需要重置所有计时器（上班时间到达时），使用精确到秒的判断
     if (isWorkDay && _isAtStartTime(now)) {
-      print('检测到准确上班时间：${now.hour}:${now.minute}:${now.second}，准备重置计时器');
+      print('检测到上班时间到达：${now.hour}:${now.minute}:${now.second}，准备重置计时器');
+      // 这是一个异步调用，但我们不需要等待它完成
       _checkAndResetAllTimers(todayDateStr);
     }
     
@@ -343,9 +344,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 计算当前时间与上班时间的差异（秒）
     final differenceInSeconds = now.difference(workStartDateTime).inSeconds;
     
-    // 只有当前时间在上班时间的前5秒内才返回true
-    // 这样可以确保只在上班时间到达的瞬间附近触发重置
-    return differenceInSeconds >= 0 && differenceInSeconds < 5;
+    // 为了确保不会错过上班时间点，我们扩大检测窗口
+    // 只要当前时间在上班时间的前10秒到后5秒范围内，就认为是上班时间
+    return differenceInSeconds >= -10 && differenceInSeconds <= 5;
   }
   
   // 获取实际下班时间，考虑加班情况
@@ -553,8 +554,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
 
   // 添加方法来更新当前时薪
   void _updateCurrentHourlyRate() {
+    final now = _timeService.now();
+    
     if (_currentStatus == WorkStatus.overtime) {
-      final now = _timeService.now();
+      // 加班状态下，实时计算实际时薪
       
       // 计算实际工作开始时间
       final startDateTime = DateTime(
@@ -587,7 +590,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         _currentRate.value = hourlyRate;
       }
     } else if (_currentStatus == WorkStatus.working || _currentStatus == WorkStatus.resting) {
-      // 搬砖中或摸鱼中状态下，使用标准时薪
+      // 搬砖中或摸鱼中状态下，始终使用标准时薪
       final standardHourlyRate = _salaryType == '时薪'
         ? _salary
         : _settingsService.getHourlySalary();
@@ -597,6 +600,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         _currentRate.value = standardHourlyRate;
       }
     }
+    // 在下班状态下不更新时薪，保持当前值
   }
 
   // 在状态变为加班时启动高频率更新
@@ -1016,17 +1020,18 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     // 计算总工作时长（标准工作时长+加班时长）(分钟)
     final totalWorkMinutes = standardWorkMinutes + overtimeMinutes;
     
-    // 计算实际时薪 - 今日搬砖/（上班时长+加班时长）
+    // 计算实际时薪 - 根据不同状态使用不同的计算方式
     double hourlyRate;
     
-    // 修改：搬砖中和摸鱼中状态下，使用标准时薪，不再实时计算
+    // 对于搬砖中和摸鱼中状态，使用标准时薪
     if (_currentStatus == WorkStatus.working || _currentStatus == WorkStatus.resting) {
-      // 直接使用用户设置的标准时薪
+      // 直接使用额定时薪
       hourlyRate = _salaryType == '时薪'
         ? _salary
         : _settingsService.getHourlySalary();
-    } else {
-      // 加班中和下班中状态，使用原有计算逻辑
+    } 
+    // 对于加班中和下班中状态，计算实际时薪（如果有工作时间）
+    else {
       if (totalWorkMinutes > 0) {
         // 将分钟转换为小时，计算实际时薪
         hourlyRate = todayEarnings / (totalWorkMinutes / 60);
@@ -1597,50 +1602,53 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     final now = _timeService.now();
     final todayDateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
     
-    // 检查今天是否已重置计时器，如果没有且当前是上班时间，则重置
+    // 检查今天是否是工作日，是否到达上班时间
     final isHoliday = _holidayService.isHoliday(now);
     final isSpecialWorkDay = _holidayService.isWorkday(now);
     final isWeekday = now.weekday <= 5; // 1-5 对应周一至周五
     final isWorkDay = isSpecialWorkDay || (!isHoliday && isWeekday);
     
-    if (isWorkDay && _isAtStartTime(now)) {
-      final lastResetDate = prefs.getString(_lastTimerResetDateKey);
-      if (lastResetDate != todayDateStr) {
-        // 重置所有计时器
-        await _checkAndResetAllTimers(todayDateStr);
-        print('应用启动时重置所有计时器 - 上班时间到');
-      }
+    // 获取上次重置计时器的日期
+    final lastResetDate = prefs.getString(_lastTimerResetDateKey);
+
+    // 判断是否需要重置计时器
+    // 如果今天是工作日，且正好是上班时间，且今天还未重置过，则重置计时器
+    if (isWorkDay && _isAtStartTime(now) && lastResetDate != todayDateStr) {
+      print('应用启动时检测到上班时间，准备重置计时器...');
+      await _checkAndResetAllTimers(todayDateStr);
+      print('应用启动时重置计时器完成');
     }
-    
-    // 检查加班日期是否为今天，如果不是，重置加班时长
-    final lastOvertimeDate = prefs.getString(_lastOvertimeDateKey);
-    if (lastOvertimeDate != null && lastOvertimeDate != todayDateStr) {
-      // 重置加班累计时长
+    // 如果今天已经重置过，则使用重置后的数据（应该都是0）
+    else if (lastResetDate == todayDateStr) {
+      print('今天已经重置过计时器，使用重置后的数据');
+      _lastRestDuration = Duration.zero;
+      _restDuration = Duration.zero;
       _lastOvertimeDuration = Duration.zero;
       _overtimeDuration = Duration.zero;
-      
-      // 保存重置后的加班时长
-      await prefs.setInt(_lastOvertimeDurationKey, 0);
-      
-      print('应用启动时重置加班时长 - 新的一天开始');
-    } else {
-      // 如果是同一天，则恢复加班累计时长
-      final lastOvertimeDurationMillis = prefs.getInt(_lastOvertimeDurationKey) ?? 0;
-      _lastOvertimeDuration = Duration(milliseconds: lastOvertimeDurationMillis);
-      _overtimeDuration = _lastOvertimeDuration;
     }
-    
-    // 如果计时器已重置，则不恢复摸鱼时长
-    final lastResetDate = prefs.getString(_lastTimerResetDateKey);
-    if (lastResetDate != todayDateStr) {
-      // 恢复摸鱼累计时长
+    // 否则使用保存的数据
+    else {
+      print('今天还未重置计时器，恢复保存的数据');
+      
+      // 检查加班日期是否为今天
+      final lastOvertimeDate = prefs.getString(_lastOvertimeDateKey);
+      if (lastOvertimeDate != null && lastOvertimeDate != todayDateStr) {
+        // 上次加班日期不是今天，重置加班数据
+        _lastOvertimeDuration = Duration.zero;
+        _overtimeDuration = Duration.zero;
+        await prefs.setInt(_lastOvertimeDurationKey, 0);
+        print('应用启动时重置加班时长 - 加班日期不是今天');
+      } else {
+        // 上次加班日期是今天，恢复加班数据
+        final lastOvertimeDurationMillis = prefs.getInt(_lastOvertimeDurationKey) ?? 0;
+        _lastOvertimeDuration = Duration(milliseconds: lastOvertimeDurationMillis);
+        _overtimeDuration = _lastOvertimeDuration;
+      }
+      
+      // 恢复摸鱼时长
       final lastRestDurationMillis = prefs.getInt(_lastRestDurationKey) ?? 0;
       _lastRestDuration = Duration(milliseconds: lastRestDurationMillis);
       _restDuration = _lastRestDuration;
-    } else {
-      // 计时器已重置，使用零值
-      _lastRestDuration = Duration.zero;
-      _restDuration = Duration.zero;
     }
     
     // 清除状态标记
@@ -1667,6 +1675,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
           } else {
             _currentStatus = WorkStatus.offWork; // 非工作时间 -> 下班中
           }
+          
+          // 设置初始时薪
+          _currentRate.value = _settingsService.getHourlySalary();
         });
       }
     });
@@ -1707,7 +1718,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
       return;
     }
     
+    // 计算昨天的日期字符串，用于保存历史数据
+    final yesterday = now.subtract(const Duration(days: 1));
+    final yesterdayStr = '${yesterday.year}-${yesterday.month.toString().padLeft(2, '0')}-${yesterday.day.toString().padLeft(2, '0')}';
+    
     print('开始重置计时器 - 新的一天开始了');
+    
+    // 保存昨天的数据到历史记录
+    await _saveDataToHistory(yesterdayStr);
     
     // 重置摸鱼时长
     _lastRestDuration = Duration.zero;
@@ -1721,6 +1739,24 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     await prefs.setInt(_lastRestDurationKey, 0);
     await prefs.setInt(_lastOvertimeDurationKey, 0);
     
+    // 清除当天所有相关数据（确保不会从持久化存储中恢复）
+    // 今日摸鱼相关
+    await _settingsService.setDailyRestMinutes(todayDateStr, 0);
+    await _settingsService.setDailyRestEarnings(todayDateStr, 0);
+    
+    // 今日加班相关
+    await _settingsService.setOvertimeMinutes(todayDateStr, 0);
+    
+    // 今日搬砖相关（确保calculateTodayEarnings重新计算）
+    await _settingsService.setDailyEarnings(todayDateStr, 0);
+    
+    // 今日时薪相关 - 重置为标准时薪，而不是0
+    final standardHourlyRate = _settingsService.getHourlySalary();
+    await _settingsService.setDailyHourlyRate(todayDateStr, standardHourlyRate);
+    
+    // 工作时长相关
+    await _settingsService.setDailyWorkMinutes(todayDateStr, 0);
+    
     // 记录本次重置的日期
     await prefs.setString(_lastTimerResetDateKey, todayDateStr);
     
@@ -1730,7 +1766,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
     
     print('已重置所有计时器数据 - 摸鱼时长和加班时长已清零');
     
-    // 更新UI
+    // 强制更新UI
     setState(() {
       // 确保重置UI显示
       if (_currentStatus == WorkStatus.resting) {
@@ -1741,6 +1777,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
         _isManualOvertime = false;
         _stopHighFrequencyHourlyRateUpdate();
       }
+      
+      // 立即刷新今日数据
+      _todayEarnings.value = 0;
+      _restEarnings.value = 0;
+      _currentRate.value = standardHourlyRate; // 使用标准时薪
     });
     
     // 显示重置通知
@@ -1753,7 +1794,70 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin, Widg
       );
     }
     
-    print('上班时间到达：已重置所有计时器');
+    print('上班时间到达：已重置所有计时器和今日数据');
+  }
+
+  // 将当前数据保存为历史记录
+  Future<void> _saveDataToHistory(String dateStr) async {
+    final prefs = await SharedPreferences.getInstance();
+    final now = _timeService.now();
+    
+    // 1. 获取当前数据
+    final currentRestDuration = _restDuration;
+    final currentOvertimeDuration = _overtimeDuration;
+    
+    // 获取当天累计的数据
+    final todayEarnings = _todayEarnings.value;
+    final restEarnings = _restEarnings.value;
+    final hourlyRate = _currentRate.value;
+    
+    print('保存昨天($dateStr)数据到历史记录 - 摸鱼:${currentRestDuration.inMinutes}分钟, 加班:${currentOvertimeDuration.inMinutes}分钟, 收入:$todayEarnings');
+    
+    // 2. 将当前数据保存到历史记录中
+    
+    // 保存摸鱼数据
+    if (currentRestDuration.inMinutes > 0) {
+      await _settingsService.setDailyRestMinutes(dateStr, currentRestDuration.inMinutes);
+      await _settingsService.setDailyRestEarnings(dateStr, restEarnings);
+    }
+    
+    // 保存加班数据
+    if (currentOvertimeDuration.inMinutes > 0) {
+      await _settingsService.setOvertimeMinutes(dateStr, currentOvertimeDuration.inMinutes);
+    }
+    
+    // 保存今日收入
+    if (todayEarnings > 0) {
+      await _settingsService.setDailyEarnings(dateStr, todayEarnings);
+    }
+    
+    // 保存今日时薪
+    if (hourlyRate > 0) {
+      await _settingsService.setDailyHourlyRate(dateStr, hourlyRate);
+    }
+    
+    // 保存工作时长（根据calculateTodayEarnings计算）
+    final workStartDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _startTime.hour,
+      _startTime.minute,
+    );
+    
+    final workEndDateTime = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      _endTime.hour,
+      _endTime.minute,
+    );
+    
+    // 计算标准工作时长
+    final standardWorkMinutes = workEndDateTime.difference(workStartDateTime).inMinutes;
+    
+    // 保存工作时长（标准工作时长 + 加班时长）
+    await _settingsService.setDailyWorkMinutes(dateStr, standardWorkMinutes + currentOvertimeDuration.inMinutes);
   }
 
   // 检查今天是否是新的工作日，需要重置加班时长

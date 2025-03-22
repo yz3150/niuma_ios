@@ -29,9 +29,37 @@ class SalaryCalculator {
     // 使用shouldWork方法判断是否是工作日
     final isWorkDay = holidayService.shouldWork(now);
     
-    // 如果今天不是工作日，则返回0
-    if (!isWorkDay) {
-      return 0;
+    // 获取当天日期字符串，用于检查是否有保存的收入数据
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final savedEarnings = settingsService.getDailyEarnings(dateStr);
+    
+    // 检查是否有保存的今日数据
+    if (savedEarnings != null && savedEarnings > 0) {
+      // 如果有保存的收入数据且大于0，使用保存的数据
+      return savedEarnings;
+    }
+    
+    // 获取昨天的日期
+    final yesterday = now.subtract(const Duration(days: 1));
+    final yesterdayStr = '${yesterday.year}-${yesterday.month.toString().padLeft(2, '0')}-${yesterday.day.toString().padLeft(2, '0')}';
+    final yesterdayEarnings = settingsService.getDailyEarnings(yesterdayStr);
+    
+    // 如果今天不是工作日，或者是工作日但还未到上班时间，使用昨天的数据
+    if (!isWorkDay || (isWorkDay && now.isBefore(DateTime(
+      now.year,
+      now.month,
+      now.day,
+      startTime.hour,
+      startTime.minute,
+    )))) {
+      // 如果有昨天的收入数据且大于0，使用昨天的数据
+      if (yesterdayEarnings != null && yesterdayEarnings > 0) {
+        return yesterdayEarnings;
+      }
+      
+      // 如果没有昨天的数据，使用标准日薪
+      final standardHoursPerDay = 8.0;
+      return settingsService.getHourlySalary() * standardHoursPerDay;
     }
     
     final workStart = DateTime(
@@ -49,12 +77,7 @@ class SalaryCalculator {
       endTime.hour,
       endTime.minute,
     );
-
-    // 如果还没到上班时间，返回0
-    if (now.isBefore(workStart)) {
-      return 0;
-    }
-
+    
     // 如果已经超过下班时间，使用下班时间计算
     final effectiveCurrentTime = now.isAfter(workEnd) ? workEnd : now;
     
