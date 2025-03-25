@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'theme/app_theme.dart';
 import 'pages/home_page.dart';
 import 'pages/settings_page.dart';
+import 'pages/main_page.dart';
 import 'utils/settings_service.dart';
 
 Future<void> main() async {
@@ -20,7 +21,8 @@ class MyApp extends StatelessWidget {
       theme: AppTheme.theme,
       initialRoute: '/',
       routes: {
-        '/': (context) => const HomePage(),
+        '/': (context) => const MainPage(),
+        '/home': (context) => const HomePage(),
         '/settings': (context) => const SettingsPage(),
       },
     );
